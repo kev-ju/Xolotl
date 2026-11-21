@@ -14,3 +14,7 @@ void ds41_ptq1_to_q2_0_strided(const void* src, size_t src_stride, void* dst, si
                                int count, void* stream);
 /// dst[i] += src[i] for i < n (device floats) on `stream` - the remote tier's rows added to an out_dev call.
 void ds41_add_f32(float* dst, const float* src, size_t n, void* stream);
+/// STRATA_EMU_LINK_GBS (measurement only, ds41_moe.cpp): one thread spins `iters` iterations on `stream` - a timed
+/// hold queued behind a host-to-device copy.  ds41_spin_iters_per_ms() times it once on a stream of its own.
+void ds41_spin(unsigned long long iters, void* stream);
+double ds41_spin_iters_per_ms();

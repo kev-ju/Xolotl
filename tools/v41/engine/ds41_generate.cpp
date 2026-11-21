@@ -3721,9 +3721,16 @@ int main(int argc, char ** argv) {
                         }
                         if (frb == std::numeric_limits<size_t>::max()) return false;
                         const double g_need = (double) dense.span_graph_bytes(total, SB);
+                        // STRATA_WIDE_DSPARK_FIT=1 (opt-in, with STRATA_WIDE_PROMPT): the test uses the wide batch's own
+                        // constants (the width line below: 0.44 / 0.38 MiB a column, 4.3 GiB fixed in both terms), so
+                        // DSpark stays loaded whenever the wide batch takes the turn in one sweep with it - not only
+                        // when the classic batch would.  The same weights either way; only the reload is saved.
+                        static const bool wide_fit = wide && std::getenv("STRATA_WIDE_DSPARK_FIT") &&
+                                                     std::atoi(std::getenv("STRATA_WIDE_DSPARK_FIT")) == 1;
+                        const double mib_l = wide_fit ? 0.44 : 0.95, mib_gr = wide_fit ? 0.38 : 0.78, gib_gr = wide_fit ? 4.3 : 2.5;
                         const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
-                        const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
-                        const int64_t fit = std::min<int64_t>((int64_t) (room / (0.95 * 1048576.0)), (int64_t) (room_g / (0.78 * 1048576.0)));
+                        const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - gib_gr * 1073741824.0 - g_need;
+                        const int64_t fit = std::min<int64_t>((int64_t) (room / (mib_l * 1048576.0)), (int64_t) (room_g / (mib_gr * 1048576.0)));
                         const bool one = fit >= dh && PB >= dh;
                         if (one) std::fprintf(stderr, "serve: DSpark kept for a %d-token batch (%lld columns fit with it loaded)\n",
                                               dh, (long long) fit);

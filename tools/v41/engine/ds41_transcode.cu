@@ -115,3 +115,45 @@ void ds41_add_f32(float* dst, const float* src, size_t n, void* stream) {
     const int64_t grid = std::min<int64_t>(((int64_t) n + threads - 1) / threads, 4096);
     k_add_f32<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>(dst, src, (int64_t) n);
 }
+
+namespace {
+// one thread, `iters` dependent steps through a volatile (so the loop is neither folded nor vectorized)
+__global__ void k_spin(unsigned long long iters) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    volatile unsigned int v = 1u;
+    for (unsigned long long i = 0; i < iters; ++i) v = v * 1664525u + 1013904223u;
+}
+}  // namespace
+
+void ds41_spin(unsigned long long iters, void* stream) {
+    if (iters == 0) return;
+    k_spin<<<1, 1, 0, (cudaStream_t) stream>>>(iters);
+}
+
+double ds41_spin_iters_per_ms() {
+    static double rate = 0.0;
+    if (rate > 0.0) return rate;
+    cudaStream_t s = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) return 0.0;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    const unsigned long long n = 4000000ull;
+    k_spin<<<1, 1, 0, s>>>(1000ull);   // the first launch pays the module load
+    cudaStreamSynchronize(s);
+    double best = 0.0;
+    for (int r = 0; r < 3; ++r) {
+        cudaEventRecord(e0, s);
+        k_spin<<<1, 1, 0, s>>>(n);
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (ms > 0.0f) best = std::max(best, (double) n / (double) ms);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    cudaStreamDestroy(s);
+    rate = best;
+    return rate;
+}
