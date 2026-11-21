@@ -1356,6 +1356,17 @@ int main(int argc, char ** argv) {
                     static std::vector<std::vector<int>> xp_pred_last((size_t) n_layer);   // the last token's top 16 only
                     static long xp_calls = 0, xp_file = 0, xp_cov_pred = 0, xp_cov_last = 0, xp_cov_la2 = 0, xp_cov_any = 0;
                     static long xp_cand_pred = 0, xp_cand_last = 0, xp_cand_la2 = 0, xp_have_pred = 0, xp_have_la2 = 0;
+                    // (c) THIS pass's own prediction for this layer, made before its attention (the D3 prefetch's
+                    // predict_multi): any of the 16, or within a token's first 8 - a read started there leads the
+                    // tier call by the layer's attention graph
+                    static long xp_same16 = 0, xp_same8 = 0, xp_cand_same16 = 0, xp_cand_same8 = 0;
+                    const bool same_ok = pf_now && pv_pred.size() >= (size_t) m * 16;
+                    auto in_same = [&](int e, int w) {
+                        if (!same_ok) return false;
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < w; ++i) if (pv_pred[(size_t) t * 16 + i] == e) return true;
+                        return false;
+                    };
                     auto has = [](const std::vector<int> & v, int e) { return std::find(v.begin(), v.end(), e) != v.end(); };
                     auto is_file = [&](int e) { return e >= 0 && !tr.resident(l, e) && !tr.in_arena(l, e); };
                     std::vector<int> seen;
@@ -1368,7 +1379,19 @@ int main(int argc, char ** argv) {
                             const bool a = has(xp_pred[(size_t) l], e), b = has(xp_la2[(size_t) l], e);
                             xp_cov_pred += a; xp_cov_la2 += b; xp_cov_any += a || b;
                             xp_cov_last += has(xp_pred_last[(size_t) l], e);
+                            xp_same16 += in_same(e, 16); xp_same8 += in_same(e, 8);
                         }
+                    if (same_ok) {
+                        std::vector<int> c16, c8;
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < 16; ++i) {
+                                const int e = pv_pred[(size_t) t * 16 + i];
+                                if (!is_file(e)) continue;
+                                if (!has(c16, e)) c16.push_back(e);
+                                if (i < 8 && !has(c8, e)) c8.push_back(e);
+                            }
+                        xp_cand_same16 += (long) c16.size(); xp_cand_same8 += (long) c8.size();
+                    }
                     for (int e : xp_pred[(size_t) l]) xp_cand_pred += is_file(e);
                     for (int e : xp_pred_last[(size_t) l]) xp_cand_last += is_file(e);
                     for (int e : xp_la2[(size_t) l]) xp_cand_la2 += is_file(e);
@@ -1397,6 +1420,11 @@ int main(int argc, char ** argv) {
                                 if (e >= 0 && !has(dst, e)) dst.push_back(e);
                             }
                     }
+                    if ((xp_calls + 1) % 1600 == 0)
+                        std::fprintf(stderr, "[xpass] this pass's own pre-attention prediction named: top 16 %.1f%% (%.2f file-tier candidates per "
+                                     "layer call), top 8 %.1f%% (%.2f)\n", xp_file ? 100.0 * xp_same16 / xp_file : 0.0,
+                                     (double) xp_cand_same16 / (xp_calls + 1), xp_file ? 100.0 * xp_same8 / xp_file : 0.0,
+                                     (double) xp_cand_same8 / (xp_calls + 1));
                     if (++xp_calls % 1600 == 0)
                         std::fprintf(stderr, "[xpass] %ld layer calls, %ld real file-tier picks | the previous pass named: predicted top 16 of all its "
                                      "tokens %.1f%% (%.2f file-tier candidates per layer call), of its last token %.1f%% (%.2f), two-ahead guesses "
