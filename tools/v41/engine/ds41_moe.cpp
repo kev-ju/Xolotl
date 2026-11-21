@@ -5660,6 +5660,11 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     const int   NE = nt * (int) K;
     const double t0 = now_ms();
     Ds41MoeStats st;
+    int io_nfr = 0;   // STRATA_IO_TRACE: the file-tier blobs this call read (mark 16, written when the call returns)
+    struct IoScope {
+        int64_t layer; int nt; const int* nfr; int64_t t0;
+        ~IoScope() { if (t0) ds41_sys::io_mark(16, (uint64_t) layer, (uint32_t) nt, *nfr, t0, ds41_sys::io_now_ns()); }
+    } io_scope{layer, nt, &io_nfr, ds41_sys::io_trace_on() ? ds41_sys::io_now_ns() : 0};
     ++im.run_seq;   // spec_read tags its stash slots with the call that will use them (one call per layer per pass)
     im.run_layer = layer;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER gpu_run_n_ex layer=%lld nt=%d nact_multi_n=%zu nfmt=%zu kNativeActBytes=%d\n",
@@ -6014,6 +6019,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     const size_t n_pj = 0;
 #endif
     const double tfg = nfg > 0 ? now_ms() : 0;
+    io_nfr = nfr;
     if (nfr > 0 || n_pj > 0) {
         if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
         // STRATA_D3_PARTS: a call's read budget in parts (default 32 = the readers, split over its blobs)
@@ -7283,6 +7289,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                    float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true,
                    const float* x_dev = nullptr) {
     Gpu& gp = *im.gpu;
+    struct IoScope {   // STRATA_IO_TRACE: mark 18, a prompt chunk tier call
+        int64_t layer; int n; int64_t t0;
+        ~IoScope() { if (t0) ds41_sys::io_mark(18, (uint64_t) layer, (uint32_t) n, 0, t0, ds41_sys::io_now_ns()); }
+    } io_scope{layer, n, ds41_sys::io_trace_on() ? ds41_sys::io_now_ns() : 0};
     if (demote_async_on()) dem_drain(gp, -1);   // (STRATA_DEMOTE_ASYNC: none is in flight past a decode token)
     const bool wide = x_dev != nullptr && out_dev != nullptr;
     const bool prof = chunk_prof();

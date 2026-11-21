@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -60,6 +62,50 @@ using ssize_t = std::ptrdiff_t;
 
 namespace ds41_sys {
 
+/// STRATA_IO_TRACE=<file> (diagnostic, no behaviour change): every positional transfer and a few engine marks as
+/// 40-byte records {i64 t0_ns, i64 t1_ns, u64 a, u32 b, u32 thread, i32 c, i32 kind} (steady clock), flushed about
+/// twice a second.  kind 0 = read (a = offset, b = bytes moved, c = fd), 1 = write (the same), 16+ = io_mark's
+/// (16 = a decode / verify tier call: a = layer, b = rows, c = file-tier blobs it read; 17 = a verify pass: b = rows;
+/// 18 = a prompt chunk tier call: a = layer, b = rows).  Each traced open prints "io trace: fd N = path" to stderr.
+struct IoTrace {
+    std::FILE* f = nullptr;
+    std::mutex mu;
+    int64_t last_flush = 0;
+    IoTrace() {
+        const char* p = std::getenv("STRATA_IO_TRACE");
+        if (p && p[0]) f = std::fopen(p, "wb");
+        if (f) std::setvbuf(f, nullptr, _IOFBF, 1 << 20);
+    }
+};
+inline IoTrace& io_trace() {
+    static IoTrace t;
+    return t;
+}
+inline bool io_trace_on() {
+    static const bool on = io_trace().f != nullptr;
+    return on;
+}
+inline int64_t io_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+inline uint32_t io_thread_id() {
+#ifdef _WIN32
+    return (uint32_t) GetCurrentThreadId();
+#else
+    static std::atomic<uint32_t> next{1};
+    thread_local uint32_t id = next.fetch_add(1);
+    return id;
+#endif
+}
+inline void io_mark(int kind, uint64_t a, uint32_t b, int32_t c, int64_t t0, int64_t t1) {
+    if (!io_trace_on()) return;
+    IoTrace& t = io_trace();
+    struct Rec { int64_t t0, t1; uint64_t a; uint32_t b, tid; int32_t c, kind; } r{t0, t1, a, b, io_thread_id(), c, kind};
+    std::lock_guard<std::mutex> lk(t.mu);
+    std::fwrite(&r, sizeof r, 1, t.f);
+    if (t1 - t.last_flush > 500000000) { std::fflush(t.f); t.last_flush = t1; }
+}
+
 /// What the engine reads from fstat: size, and identity (to tell whether two descriptors are the same file).
 struct Stat {
     uint64_t st_size = 0;
@@ -99,6 +145,7 @@ inline int open(const char* path, int flags, int /*mode*/ = 0) {
     }
     const int fd = _open_osfhandle((intptr_t) h, (acc == _O_WRONLY ? _O_WRONLY : acc == _O_RDWR ? _O_RDWR : _O_RDONLY) | _O_BINARY);
     if (fd < 0) { CloseHandle(h); errno = EMFILE; return -1; }
+    if (io_trace_on()) std::fprintf(stderr, "io trace: fd %d = %s%s\n", fd, path, (flags & O_DIRECT) ? " (direct)" : "");
     return fd;
 }
 
@@ -116,6 +163,7 @@ inline ssize_t xfer(int fd, void* buf, size_t n, int64_t off, bool write) {
     };
     thread_local ThreadEvent tev;
     const HANDLE ev = tev.h;
+    const int64_t tr0 = io_trace_on() ? io_now_ns() : 0;
     size_t done = 0;
     while (done < n) {
         const DWORD want = (DWORD) ((n - done) > (size_t) (1u << 30) ? (1u << 30) : (n - done));
@@ -146,6 +194,7 @@ inline ssize_t xfer(int fd, void* buf, size_t n, int64_t off, bool write) {
         done += got;
         if (got < want) break;
     }
+    if (tr0) io_mark(write ? 1 : 0, (uint64_t) off, (uint32_t) done, fd, tr0, io_now_ns());
     return (ssize_t) done;
 }
 

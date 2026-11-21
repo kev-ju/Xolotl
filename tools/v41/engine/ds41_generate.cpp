@@ -1269,6 +1269,10 @@ int main(int argc, char ** argv) {
         // D3 (the batched per-class verify tier) is the default: correct (bias-off verify-vs-prefill gate, near-ties
         // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
         static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
+        struct IoScope {   // STRATA_IO_TRACE: mark 17, one verify pass
+            int m, pos; int64_t t0;
+            ~IoScope() { if (t0) ds41_sys::io_mark(17, (uint64_t) pos, (uint32_t) m, 0, t0, ds41_sys::io_now_ns()); }
+        } io_scope{m, pos, ds41_sys::io_trace_on() ? ds41_sys::io_now_ns() : 0};
         double tq = now_ms();
         auto lap = [&](int i) { const double t = dp_now(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
