@@ -9931,6 +9931,20 @@ void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uin
             if (ok) return;
         }
     }
+    // the STRATA_BLOB_PRIMARY copy, as read_part does: the blob is one aligned span of a file that is only ever opened
+    // unbuffered.  On Windows the model file is also mapped and read through the cache, and NTFS then serves its
+    // unbuffered reads one at a time (measured: 0.9 GiB/s at any queue depth, against 5-6 GiB/s on an unmapped file).
+    if (pfd_ >= 0 && scratch && scratch_bytes >= scratch_) {
+        const uint64_t po = poff_[(size_t) (layer * g_.n_experts + expert)];
+        if (po != ~0ull) {
+            const uint64_t n = expert_bytes(layer, expert);
+            const uint64_t step = (uint64_t) (scratch_bytes - 8192) & ~(uint64_t) 4095;
+            bool ok = true;
+            for (uint64_t a = 0; a < n && ok; a += step)
+                ok = read_direct(po + a, (size_t) std::min<uint64_t>(step, n - a), dst + a, scratch, scratch_bytes, pfd_);
+            if (ok) return;
+        }
+    }
     if (!direct_ok_ || scratch_bytes < scratch_) {
         read(layer, expert, dst);
         return;
