@@ -835,6 +835,7 @@ struct Gpu {
     /// Ds41MoeConfig::chunk_prestage: layer `c_pre_layer`'s arena experts `c_pre_e` (ascending ids, not VRAM-resident)
     /// are DMA'd / being DMA'd into c_stage[c_pre_half] at stride `c_pre_sl`, event c_copied[c_pre_half]
     int c_pre_layer = -1, c_pre_half = -1;
+    int c_alt_next = 0;   ///< STRATA_CHUNK_HALF_ALT: the device half the next class pass's first batch takes
     int64_t c_pre_sl = 0;
     std::vector<int32_t> c_pre_e;
     /// Layer prestage (any geometry, per-expert formats too): while the caller runs layer `p_layer`'s dense half, its
@@ -6763,8 +6764,46 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
 // launches by event pairs), printed by release_chunk.  Timing only - the same work runs.
 struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, file_rd = 0, wait_copied = 0, sync = 0, kern = 0, resident_kern = 0; int64_t calls = 0, launches = 0;
                    double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0;   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
-                   double kern_cls[64] = {}; int64_t ent_cls[64] = {}; };   // per format class: kernel ms, routed entries
+                   double kern_cls[64] = {}; int64_t ent_cls[64] = {};     // per format class: kernel ms, routed entries
+                   // host time by part of the call (kChunkHostNames), the streamed DMAs' count and bytes
+                   double host[20] = {}; int64_t n_dma = 0; double dma_gb = 0; int64_t n_pass = 0;
+                   // STRATA_CHUNK_DMA_PROF=1: the streamed DMAs' own time on the card (an event pair around each)
+                   double dma_ms = 0, dma_max = 0; int64_t dma_slow = 0;
+                   // m_tc (the MMQ transcode buffer): how often a launch re-allocated it, the time, and how often
+                   // STRATA_MMQ_TC_KEEP kept it instead
+                   int64_t tc_realloc = 0, tc_kept = 0; double tc_realloc_ms = 0, tc_last_gib = 0; };
 ChunkProf g_cprof;
+// STRATA_CHUNK_TL=<layer> (diagnostic; adds timing events, no other change): one line per class pass of that layer's
+// prompt calls - when the host started the pass, had its copies queued, had its last file blob, had its kernels queued,
+// and when the card finished the pass's copies and kernels (ms since the layer's call began).
+struct ChunkTl {
+    int layer = -2; double t0 = 0; cudaEvent_t base = nullptr;
+    struct Pass { int cf, nA, nF; double mb, h_start, h_file, h_end; cudaEvent_t ev_copy, ev_kern; };
+    std::vector<Pass> passes;
+};
+ChunkTl g_ctl;
+// STRATA_CHUNK_FLUSH (opt-in; the same work in the same order): on Windows (WDDM) the driver collects the calls made on
+// a stream and hands them to the card in batches, so a prompt layer's expert copies and kernels, queued while the host
+// waited for file blobs, only started when the host reached the layer's final sync (STRATA_CHUNK_TL, 2026-11-21, 3090:
+// class 2's copies queued by 24 ms, done at 54 ms; the card idle from 11 to 47 ms of an 89 ms layer).  cudaStreamQuery
+// hands a stream's queued work to the card at once.  Bit 1: the copy stream, after every DMA of a streamed blob and
+// when the host is about to wait for a file blob; bit 2: the compute stream, after every pass's launches.
+static int chunk_flush_mode() {
+    static const int m = std::getenv("STRATA_CHUNK_FLUSH") ? std::atoi(std::getenv("STRATA_CHUNK_FLUSH")) : 0;
+    return m;
+}
+static inline void stream_flush(cudaStream_t s) {
+    (void) cudaStreamQuery(s);     // cudaErrorNotReady is the usual answer: not an error
+    (void) cudaGetLastError();
+}
+static int chunk_tl_layer() {
+    static const int l = std::getenv("STRATA_CHUNK_TL") ? std::atoi(std::getenv("STRATA_CHUNK_TL")) : -1;
+    return l;
+}
+static const char* const kChunkHostNames[20] = { "setup", "resident launch", "lazy prestage fill", "prestage launches",
+    "pre-half launches", "stream: memcpy calls", "stream: launches", "stream: rest", "stream: file wait", "readers join",
+    "next prestage", "collect + sum queue", "final sync", "after sync", "pf prepare", "cpu post", "layer ra start",
+    "layer ra stop", "class list", "pstage next" };
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
 #if defined(DS4_MOE_MMQ)
@@ -7350,6 +7389,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> tcev;  // prof: one pair per MMQ sub-run's PTQ1_0 transcode (inside kev)
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> dmaev; // STRATA_CHUNK_DMA_PROF: one pair per streamed DMA
+    static const bool dma_prof = std::getenv("STRATA_CHUNK_DMA_PROF") != nullptr;
     bool in_resident = true;
     std::vector<char> kev_res;
     const int64_t H = im.g.n_embd, K = im.g.top_k, NE = (int64_t) n * K;
@@ -7361,7 +7402,18 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                       : gp.ccpu && gp.ccpu->pending ? gp.ccpu->mask_e.data() : nullptr;
     auto in_pass = [&](int64_t j) { return (cf < 0 || im.g.cls(layer, ids[j]) == cf) && !(rmask && rmask[ids[j]]); };
     const double t0 = now_ms();
+    double t_lap = t0;
+    auto lap = [&](int i) { if (prof) { const double t = now_ms(); g_cprof.host[i] += t - t_lap; t_lap = t; } };
     Ds41MoeStats st;
+    const bool tl = chunk_tl_layer() == (int) layer && gp.c_ready;
+    double tl_file = 0;
+    if (tl && first_pass) {
+        for (auto& p : g_ctl.passes) { cudaEventDestroy(p.ev_copy); cudaEventDestroy(p.ev_kern); }
+        g_ctl.passes.clear();
+        if (!g_ctl.base) cudaEventCreate(&g_ctl.base);
+        g_ctl.t0 = g_ctl.t0 > 0 ? g_ctl.t0 : t0;
+        cudaEventRecord(g_ctl.base, gp.s);
+    }
 
     if (n > gp.c_tok) {   // (re)allocate the DEVICE buffers for n tokens (release_chunk gives them back)
         for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_w, gp.c_out}) if (p) cudaFree(p);
@@ -7645,22 +7697,32 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         size_t tc_max = SIZE_MAX;
         if (strided && MP.SL2 > 0) {
             const size_t want = (size_t) std::max<int64_t>(1, gp.c_half / SL) * MP.SL2;
-            if (gp.m_tc_cap < want) {
+            // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
+            // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
+            // per MMQ launch
+            static const size_t tc_cap = (size_t) ((std::getenv("STRATA_MMQ_TC_GIB") ? std::atof(std::getenv("STRATA_MMQ_TC_GIB")) : 1.0) * 1073741824.0);
+            // STRATA_MMQ_TC_KEEP=1 (opt-in): a buffer that already has the size this launch would allocate - the cap,
+            // when `want` is above it - is kept.  Without it every such launch freed and re-allocated the buffer
+            // (m_tc_cap < want stays true), and on Windows that cudaFree / cudaMalloc pair held the card's queued
+            // copies back for tens of ms a layer (STRATA_CHUNK_TL, 2026-11-21).  The re-allocation would have come
+            // out at the same size unless the free VRAM had dropped under it since, so tc_max is the same.
+            static const bool tc_keep = std::getenv("STRATA_MMQ_TC_KEEP") && std::getenv("STRATA_MMQ_TC_KEEP")[0] == '1';
+            const size_t tc_full = std::min(want, tc_cap) / MP.SL2 * MP.SL2;
+            if (gp.m_tc_cap < want && tc_keep && gp.m_tc && gp.m_tc_cap == tc_full) {
+                if (prof) ++g_cprof.tc_kept;
+            } else if (gp.m_tc_cap < want) {
+                const double ta = prof ? now_ms() : 0;
                 if (gp.m_tc) cudaFree(gp.m_tc);
                 gp.m_tc = nullptr;
                 gp.m_tc_cap = 0;
                 size_t fr = 0, tot = 0;
                 cudaMemGetInfo(&fr, &tot);
                 const size_t keep = (size_t) 2 << 30;   // room for the dense pass buffer (grows with the prompt)
-                // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
-                // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
-                // per MMQ launch
-                const char* tce = std::getenv("STRATA_MMQ_TC_GIB");
-                const size_t tc_cap = (size_t) ((tce ? std::atof(tce) : 1.0) * 1073741824.0);
                 size_t got = fr > keep ? std::min(std::min(want, tc_cap), fr - keep) : 0;
                 got = got / MP.SL2 * MP.SL2;
                 if (got >= MP.SL2 && cudaMalloc(&gp.m_tc, got) == cudaSuccess) gp.m_tc_cap = got;
                 else { (void) cudaGetLastError(); gp.m_tc = nullptr; }
+                if (prof) { ++g_cprof.tc_realloc; g_cprof.tc_realloc_ms += now_ms() - ta; g_cprof.tc_last_gib = (double) gp.m_tc_cap / 1073741824.0; }
             }
             tc_max = gp.m_tc_cap / MP.SL2;
             if (tc_max == 0) strided = false;
@@ -7730,8 +7792,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         run_p.push_back((unsigned long long) gp.cache->device_slot(slot_e[(size_t) e]));
         ent_hit += cnt[(size_t) e];
     }
+    lap(0);
     launch(run_e, run_p);
     in_resident = false;
+    lap(1);
 
     // ---- streamed experts: arena ones, then the file tier, in batches that fit one device half.  File-tier blobs
     // are read by a background pool into pinned slots (both bounce halves, `cap` blobs; more = waves) from here on;
@@ -7757,6 +7821,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         gp.p_layer = -1;
         if (nr) chunk_pstage_fill(im, layer, routed.data(), n);
     }
+    lap(2);
     if (gp.p_layer == (int) layer && !arena_e.empty()) {   // layer prestage: launch the arena experts already on the card
         std::vector<int32_t> es, rest;
         std::vector<unsigned long long> ps;
@@ -7789,7 +7854,13 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         }
         arena_e = std::move(rest);
     }
+    lap(3);
     int h0 = 0;   // the first half the batch loop below uses
+    // STRATA_CHUNK_HALF_ALT=1 (opt-in; the same copies and launches): a pass's first batch takes the half the previous
+    // pass's last batch did not use.  Every pass used to start in half 0, so a pass's copies waited for the previous
+    // pass's kernels (c_used[0]) although the other half was free.
+    static const bool half_alt = std::getenv("STRATA_CHUNK_HALF_ALT") && std::getenv("STRATA_CHUNK_HALF_ALT")[0] == '1';
+    if (half_alt) h0 = gp.c_alt_next & 1;
     bool used_pre = false;
     if (gp.c_pre_layer == (int) layer && gp.c_pre_sl == SL) {
         std::vector<int32_t> pidx((size_t) NX, -1);
@@ -7908,6 +7979,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         start_wave();
     }
     int h_last = used_pre ? 1 - h0 : -1;
+    lap(4);
     for (size_t b0 = 0, bi = 0; b0 < stream_e.size(); b0 += (size_t) per_half, ++bi) {
         const size_t b1 = std::min(stream_e.size(), b0 + (size_t) per_half);
         const int h = (int) ((h0 + bi) & 1);
@@ -7929,10 +8001,15 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 Gpu::LayerRA& ra = *rap;
                 const int32_t q = ra.idx[(size_t) order[2][i - nA]];
                 if (!ra.ready[(size_t) q].load(std::memory_order_acquire)) {
+                    lap(7);
+                    if (chunk_flush_mode() & 1) stream_flush(gp.s_cp);
+                    if (chunk_flush_mode() & 2) stream_flush(gp.s);
                     const double tw = now_ms();
                     ra.ready[(size_t) q].wait(0, std::memory_order_acquire);
                     t_file += now_ms() - tw;
+                    lap(8);
                 }
+                if (tl) tl_file = now_ms();
                 src = ra.ptr[(size_t) q];
             } else {
                 const size_t k = i - nA;
@@ -7950,7 +8027,14 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 src = slot_ptr(k);
             }
             uint8_t* d = (uint8_t*) gp.c_stage[h] + (i - b0) * (size_t) SL;
+            lap(7);
+            cudaEvent_t de0 = nullptr, de1 = nullptr;
+            if (prof && dma_prof) { cudaEventCreate(&de0); cudaEventCreate(&de1); cudaEventRecord(de0, gp.s_cp); }
             ck(cudaMemcpyAsync(d, src, (size_t) BL, cudaMemcpyHostToDevice, gp.s_cp), "stream dma");
+            if (de0) { cudaEventRecord(de1, gp.s_cp); dmaev.emplace_back(de0, de1); }
+            if (chunk_flush_mode() & 4) stream_flush(gp.s_cp);
+            lap(5);
+            if (prof) { ++g_cprof.n_dma; g_cprof.dma_gb += (double) BL / 1e9; }
             es.push_back(stream_e[i]);
             ps.push_back((unsigned long long) d);
         }
@@ -7959,6 +8043,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         // one launch per adjacent run inside the batch (the arena / file boundary can split one)
         std::vector<int32_t> re;
         std::vector<unsigned long long> rp;
+        lap(7);
         for (size_t q = 0; q < es.size(); ++q) {
             if (!re.empty() && first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]]) {
                 launch(re, rp);
@@ -7969,9 +8054,24 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             rp.push_back(ps[q]);
         }
         launch(re, rp);
+        lap(6);
         ck(cudaEventRecord(gp.c_used[h], gp.s), "used");
+        if (chunk_flush_mode() & 1) stream_flush(gp.s_cp);
+        if (chunk_flush_mode() & 2) stream_flush(gp.s);
+    }
+    lap(7);
+    if (half_alt && h_last >= 0) gp.c_alt_next = 1 - h_last;
+    if (tl) {
+        ChunkTl::Pass p{ (int) CI, (int) nA, (int) nF, (double) (nA + nF) * (double) BL / 1048576.0, t0 - g_ctl.t0,
+                         tl_file > 0 ? tl_file - g_ctl.t0 : 0.0, now_ms() - g_ctl.t0, nullptr, nullptr };
+        cudaEventCreate(&p.ev_copy);
+        cudaEventCreate(&p.ev_kern);
+        cudaEventRecord(p.ev_copy, gp.s_cp);
+        cudaEventRecord(p.ev_kern, gp.s);
+        g_ctl.passes.push_back(p);
     }
     for (auto& t : readers) t.join();
+    lap(9);
     const int64_t n_file = (int64_t) nF;
     if (prof && nF && pf_slab < 0 && !use_ra) {
         g_cprof.file_rd += now_ms() - t_rd0;
@@ -7989,6 +8089,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         }
         chunk_prestage(im, nl, h_last >= 0 ? 1 - h_last : 0);
     }
+    lap(10);
+    if (prof) ++g_cprof.n_pass;
 
     // MIMO_CHUNK_PROF: every class pass's kernels, file waits and wall (a layer runs one pass per format class; only
     // the last one reaches the weighted sum below - counting only that one under-reported the prompt's expert time)
@@ -8014,6 +8116,17 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         }
         g_cprof.tc_launches += (int64_t) tcev.size();
         tcev.clear();
+        if (!dmaev.empty()) cudaEventSynchronize(dmaev.back().second);
+        for (auto& e : dmaev) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e.first, e.second);
+            g_cprof.dma_ms += ms;
+            g_cprof.dma_max = std::max(g_cprof.dma_max, (double) ms);
+            g_cprof.dma_slow += ms > 1.0;
+            cudaEventDestroy(e.first);
+            cudaEventDestroy(e.second);
+        }
+        dmaev.clear();
         g_cprof.launches += (int64_t) kev_res.size();
         g_cprof.file += t_file;
         g_cprof.wall += now_ms() - t0;
@@ -8038,8 +8151,24 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMemcpyAsync(out_dev, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToDevice, gp.s), "out d2d");
     else if (!out_dev)
         ck(cudaMemcpyAsync(gp.c_hparts, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "out d2h");
+    lap(11);
     const double ts = now_ms();
     ck(cudaStreamSynchronize(gp.s), "chunk sync");
+    lap(12);
+    if (tl && !g_ctl.passes.empty()) {
+        std::fprintf(stderr, "chunk tl: layer %lld, %d rows: sum queued %.1f ms, synced %.1f ms; reader done %.1f ms\n", (long long) layer, n,
+                     ts - g_ctl.t0, now_ms() - g_ctl.t0, gp.lra && gp.lra->t_last.load() > 0 ? gp.lra->t_last.load() - g_ctl.t0 : -1.0);
+        for (const auto& p : g_ctl.passes) {
+            float c = 0, k = 0;
+            cudaEventSynchronize(p.ev_copy);
+            cudaEventElapsedTime(&c, g_ctl.base, p.ev_copy);
+            cudaEventElapsedTime(&k, g_ctl.base, p.ev_kern);
+            std::fprintf(stderr, "chunk tl:   class %d: %d arena + %d file blobs, %.0f MiB; host start %.1f, last file blob %.1f, "
+                                 "queued %.1f; card copies done %.1f, kernels done %.1f\n", p.cf, p.nA, p.nF, p.mb, p.h_start,
+                         p.h_file, p.h_end, (double) c, (double) k);
+        }
+        g_ctl.t0 = 0;
+    }
     if (!out_dev) std::memcpy(out, gp.c_hparts, (size_t) n * (size_t) H * 4);
     if (im.cfg.saliency) {   // REAP calibration: every entry's unweighted output row, back to the host
         im.sal_parts.resize((size_t) NE * (size_t) H);
@@ -8071,6 +8200,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         g_cprof.sync += now_ms() - ts;
         prof_pass();
         g_cprof.calls += 1;
+        t_lap = now_ms();   // (prof_pass's own event waits are the profiler's)
     }
     st.hits = ent_hit;
     st.pcie = ent_str;
@@ -8121,7 +8251,11 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                    void* out_dev, const float* x_dev = nullptr) {
     // chunk_prefetch: make this layer's file-tier experts available in a slab (and start the next layer's read), so
     // the passes below DMA out of pinned memory instead of reading NVMe on their critical path (a no-op when off).
+    const bool prof = chunk_prof();
+    double t_lap = prof ? now_ms() : 0;
+    auto lap = [&](int i) { if (prof) { const double t = now_ms(); g_cprof.host[i] += t - t_lap; t_lap = t; } };
     chunk_pf_prepare(im, layer, n);
+    lap(14);
     if (!im.g.per_expert()) {
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, -1, true, true, x_dev)) return false;
         chunk_pstage_next(im, layer, n);
@@ -8130,6 +8264,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int64_t NE = (int64_t) n * im.g.top_k;
     const bool rc = im.gpu->rchunk && remote_chunk_post(im, layer, n, ids, x);   // STRATA_DS41_REMOTE
     const bool lc = !rc && chunk_cpu_post(im, layer, n, ids, x);                // STRATA_CHUNK_CPU
+    lap(15);
     const char* skip = rc ? im.gpu->rchunk->mask_e.data() : lc ? im.gpu->ccpu->mask_e.data() : nullptr;
     std::vector<int> cl;
     for (int64_t j = 0; j < NE; ++j) {
@@ -8139,16 +8274,21 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     std::sort(cl.begin(), cl.end());
     // the layer's whole file tier starts streaming now (all class passes); off with a prefetch slab or STRATA_LAYER_RA=0
+    lap(18);
     if (layer_ra_on() && !im.cstage)
         layer_ra_start(im, layer, n, ids, skip);
+    lap(16);
     for (size_t i = 0; i < cl.size(); ++i)
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size(), x_dev)) {
             layer_ra_stop(*im.gpu);
             chunk_cpu_drop(*im.gpu);
             return false;
         }
+    if (prof) t_lap = now_ms();
     layer_ra_stop(*im.gpu);
+    lap(17);
     chunk_pstage_next(im, layer, n);
+    lap(19);
     return true;
 }
 #endif
@@ -8776,6 +8916,23 @@ void Ds41MoeTier::release_chunk() {
                      (long long) c.calls, (long long) c.launches, c.wall, c.file, c.wait_copied, c.sync,
                      c.wall - c.file - c.wait_copied - c.sync, c.file_rd, c.kern, c.resident_kern, c.file_gb, c.rd_busy,
                      c.rd_busy > 0 ? c.file_gb / (c.rd_busy / 1000.0) : 0.0);
+        {
+            std::string hs;
+            char buf[96];
+            for (int i = 0; i < 20; ++i) {
+                if (c.host[i] < 0.5) continue;
+                std::snprintf(buf, sizeof buf, "%s%s %.0f", hs.empty() ? "" : ", ", kChunkHostNames[i], c.host[i]);
+                hs += buf;
+            }
+            std::fprintf(stderr, "chunk prof host (ms): %s; %lld class passes, %lld streamed DMAs, %.1f GB\n", hs.c_str(),
+                         (long long) c.n_pass, (long long) c.n_dma, c.dma_gb);
+            if (c.tc_realloc || c.tc_kept)
+                std::fprintf(stderr, "chunk prof m_tc: %lld launches re-allocated the transcode buffer (%.0f ms, last %.3f GiB), %lld kept it\n",
+                             (long long) c.tc_realloc, c.tc_realloc_ms, c.tc_last_gib, (long long) c.tc_kept);
+            if (c.dma_ms > 0)
+                std::fprintf(stderr, "chunk prof DMA: %.0f ms on the card for %.1f GB = %.1f GB/s while copying; %lld over 1 ms, max %.1f ms\n",
+                             c.dma_ms, c.dma_gb, c.dma_gb / (c.dma_ms / 1000.0), (long long) c.dma_slow, c.dma_max);
+        }
         std::fprintf(stderr, "chunk prof MMQ: %lld sub-runs; PTQ1_0 -> Q2_0 transcode %.0f ms GPU (inside the grouped "
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
