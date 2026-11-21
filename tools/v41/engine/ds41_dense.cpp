@@ -2983,7 +2983,7 @@ static bool engram_ahead_take(Ds41Dense::Impl & im, int64_t pos0, int n, bool & 
 // same stream: the same bytes.  Only begin()'s single-token pass: the batch path's upload_span writes some of the same
 // tensors synchronously afterwards.
 static bool input_pack(const Ds41Dense::Impl & im) {
-#if defined(DS41_HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#if defined(DS41_HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 13000  // CUDA 12.8 declares cudaMemcpyBatchAsync with a failIdx argument
     static const bool on = env_on("STRATA_INPUT_PACK", false);
     return on && !im.cpu;
 #else
@@ -2993,7 +2993,7 @@ static bool input_pack(const Ds41Dense::Impl & im) {
 }
 
 static bool flush_pack(Ds41Dense::Impl & im) {
-#if defined(DS41_HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#if defined(DS41_HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 13000  // CUDA 12.8 declares cudaMemcpyBatchAsync with a failIdx argument
     const size_t k = im.pack_dst.size();
     if (k == 0) return true;
     std::vector<const void *> src(k);
