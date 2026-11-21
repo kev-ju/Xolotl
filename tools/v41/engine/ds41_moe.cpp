@@ -649,7 +649,7 @@ struct ChunkCpu {
 /// bound the turn.  STRATA_CHUNK_CPU (above) moves arena experts to the decode tier's CPU kernels - not the card's
 /// bits, and taking experts out of the passes moves the others between MMQ and MMVQ.  This one differs in three ways:
 ///   - only experts the card would multiply with MMQ are taken (streamed ones of a class mmq_plan covers, Q2_0 /
-///     PTQ1_0 matrices), and the CPU computes MMQ's own sums (ds41_chunk_cpux.hpp: the same integer dot products, the
+///     PTQ1_0 / Q2_K matrices; STRATA_CHUNK_CPUX_Q2K=0 leaves the Q2_K classes on the card), and the CPU computes MMQ's own sums (ds41_chunk_cpux.hpp: the same integer dot products, the
 ///     same float operations in the same order);
 ///   - the float steps that are not plain IEEE arithmetic stay on the card: the activation quantizers and the SwiGLU
 ///     (__expf) run there, on the CPU's rows, with the kernels the MMQ path uses (mapped host memory in and out: no
@@ -664,7 +664,8 @@ struct ChunkCpu {
 ///   _GBS=X: the share from a link rate instead, cpu / (cpu + X) with the CPU's measured GB/s (_CPU_GBS pins it).
 ///   _SRC (3): 1 = arena experts only, 2 = file-tier only.   _THREADS (hardware threads - 4).
 ///   _CHECK=1: the card computes everything as without the switch, and every CPU row is compared with the card's
-///   (release_chunk prints the count).   _FMA=0: the sums without the fused multiply-add (a card build with -fmad=false).
+///   (release_chunk prints the count).   _FMA=0: the sums without the fused multiply-add (a card build with -fmad=false);
+///   _VAR=<bits>: the contraction variant (cpux::rows), for another compiler.
 struct CpuxBuf {   // host memory the card reads and writes in place (mapped pinned)
     uint8_t* h = nullptr;
     uint8_t* d = nullptr;
@@ -688,9 +689,11 @@ struct ChunkCpux {
     cudaStream_t s = nullptr;                 ///< its own stream: the quantizers and the SwiGLU of the CPU's rows
     std::vector<int8_t> cls_ok;               ///< per format class: -1 not looked at, 0 the card's, 1 the CPU can
     bool pending = false;                     ///< the current chunk call has CPU work out
-    bool check = false, check_pending = false, fma = true;
+    bool check = false, check_pending = false;
+    int var = 0;                              ///< how the card's compiler contracted the sums (cpux::rows)
     int64_t layer = -1;
     int64_t nr = 0;                           ///< CPU rows (entries) of the call
+    int64_t nr0 = 0;                          ///< rows [0, nr0): the down matrix takes D4 activations; the rest D2S6 (Q2_K)
     int n_file = 0;                           ///< its experts that come from the layer read-ahead
     double took_gb = 0;
     std::vector<int32_t> uidx;                ///< expert -> index in ue (-1 = the card's)
@@ -700,7 +703,9 @@ struct ChunkCpux {
     size_t ust_cap = 0;
     std::vector<int32_t> ent_tok, arow;       ///< CPU row -> token; -> itself (the down product's activation)
     CpuxBuf xin, xq, gu, hh, xd, rows, rr;    ///< x, its q8_1 rows, gate|up rows, h, its q8_1 rows, out rows, parts rows
+    CpuxBuf xq2, xd2;                         ///< x and h as Q2_K's MMQ takes them (the D2S6 layout)
     cpux::Acts ax, ad;
+    cpux::ActsK axk, adk;
     std::atomic<int64_t> busy_ns{0};
     std::vector<float> chk;
     double cpu_gbs = 0;                       ///< the pool's measured rate (GB of weights a second), a running mean
@@ -708,7 +713,7 @@ struct ChunkCpux {
     double gb = 0, post_ms = 0, wait_ms = 0, gpu_ms = 0, down_ms = 0, busy_ms = 0;
     ~ChunkCpux() {
         pool.reset();
-        for (CpuxBuf* b : {&xin, &xq, &gu, &hh, &xd, &rows, &rr}) b->release();
+        for (CpuxBuf* b : {&xin, &xq, &gu, &hh, &xd, &rows, &rr, &xq2, &xd2}) b->release();
         if (s) cudaStreamDestroy(s);
     }
 };
@@ -7155,10 +7160,13 @@ static bool short_mmvq_on() {
     static const bool on = std::getenv("STRATA_SHORT_MMVQ") && std::getenv("STRATA_SHORT_MMVQ")[0] == '1';
     return on;
 }
-/// STRATA_MMQ_TC_KEEP=1 (see gpu_run_chunk's tc_ensure)
-static bool mmq_tc_keep() {
-    static const bool on = std::getenv("STRATA_MMQ_TC_KEEP") && std::getenv("STRATA_MMQ_TC_KEEP")[0] == '1';
-    return on;
+/// STRATA_MMQ_TC_KEEP=1 / 2 (see gpu_run_chunk's tc_ensure): 0 = off
+static int mmq_tc_keep() {
+    static const int m = [] {
+        const char* e = std::getenv("STRATA_MMQ_TC_KEEP");
+        return e && e[0] == '1' ? 1 : e && e[0] == '2' ? 2 : 0;
+    }();
+    return m;
 }
 
 /// The prestage region, allocated once (false = prestage off for good: STRATA_PRESTAGE_GIB=0 or no room).
@@ -7579,8 +7587,12 @@ bool cpux_class_ok(Ds41MoeImpl& im, int c) {
     const int tg = GL.gu_type, tu = GL.up_type >= 0 ? GL.up_type : GL.gu_type, td = GL.d_type;
     if (!cpux::type_ok(tg) || !cpux::type_ok(tu) || !cpux::type_ok(td)) return false;
     const MmqPlan P = mmq_plan(GL, im.bl[(size_t) c]);
-    if (!P.ok || P.gt != cpux::kTypeQ20 || P.ut != cpux::kTypeQ20 || P.dt != cpux::kTypeQ20) return false;
+    auto eff = [](int t) { return t == cpux::kTypePtq1 ? cpux::kTypeQ20 : t; };   // what MMQ multiplies
+    if (!P.ok || P.gt != eff(tg) || P.ut != eff(tu) || P.dt != eff(td)) return false;
     if (GL.n_embd % 128 != 0 || GL.n_ff % 128 != 0 || GL.n_embd > cpux::kMaxK || GL.n_ff > cpux::kMaxK) return false;
+    const bool has_k = tg == cpux::kTypeQ2K || tu == cpux::kTypeQ2K || td == cpux::kTypeQ2K;
+    static const bool q2k = !(std::getenv("STRATA_CHUNK_CPUX_Q2K") && std::atoi(std::getenv("STRATA_CHUNK_CPUX_Q2K")) == 0);
+    if (has_k && (!q2k || GL.n_embd % 256 != 0 || GL.n_ff % 256 != 0)) return false;
     if (GL.had_block != 0 || GL.gu_nib || GL.tail_off != 0) return false;
     const size_t gr = cpux::row_bytes(tg, (int) GL.n_embd), ur = cpux::row_bytes(tu, (int) GL.n_embd),
                  dr = cpux::row_bytes(td, (int) GL.n_ff);
@@ -7588,7 +7600,7 @@ bool cpux_class_ok(Ds41MoeImpl& im, int c) {
     if (GL.down_off + (size_t) GL.n_embd * dr > (size_t) im.bl[(size_t) c]) return false;
     // a PTQ1_0 matrix is multiplied from the transcode buffer; without STRATA_MMQ_TC_KEEP every launch re-allocates
     // it, and a launch that gets none runs on MMVQ - not known when the CPU starts
-    if (P.SL2 > 0 && !mmq_tc_keep()) return false;
+    if (P.SL2 > 0 && mmq_tc_keep() < 1) return false;
     return true;
 }
 
@@ -7620,13 +7632,13 @@ void cpux_task(Ds41MoeImpl& im, int phase, int task) {
         const int type = up ? (GL.up_type >= 0 ? GL.up_type : GL.gu_type) : GL.gu_type;
         float* gu = (float*) c.gu.h;
         for (int t = 0; t < nt; ++t) out[t] = gu + (size_t) (q0 + t) * (size_t) (2 * FF) + (up ? FF : 0);
-        cpux::rows(type, blob + (up ? GL.up_off : 0), H, r0, r1, c.ax, c.ent_tok.data() + q0, nt, out, c.fma, sc);
+        cpux::rows(type, blob + (up ? GL.up_off : 0), H, r0, r1, c.ax, c.axk, c.ent_tok.data() + q0, nt, out, c.var, sc);
     } else {
         const int G = H / 8;
         const int r0 = 8 * (part * G / kCpuxP2), r1 = 8 * ((part + 1) * G / kCpuxP2);
         float* rows = (float*) c.rows.h;
         for (int t = 0; t < nt; ++t) out[t] = rows + (size_t) (q0 + t) * (size_t) H;
-        cpux::rows(GL.d_type, blob + GL.down_off, FF, r0, r1, c.ad, c.arow.data() + q0, nt, out, c.fma, sc);
+        cpux::rows(GL.d_type, blob + GL.down_off, FF, r0, r1, c.ad, c.adk, c.arow.data() + q0, nt, out, c.var, sc);
     }
     c.busy_ns.fetch_add(steady_ns() - t0, std::memory_order_relaxed);
 }
@@ -7645,7 +7657,7 @@ bool cpux_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const 
     static const double cpu_gbs_pin = env_d("STRATA_CHUNK_CPUX_CPU_GBS", 0.0);
     static const int src = env_i("STRATA_CHUNK_CPUX_SRC", 3);
     static const bool check = env_i("STRATA_CHUNK_CPUX_CHECK", 0) == 1;
-    static const bool fma = env_i("STRATA_CHUNK_CPUX_FMA", 1) != 0;
+    static const int var = env_i("STRATA_CHUNK_CPUX_VAR", env_i("STRATA_CHUNK_CPUX_FMA", 1) != 0 ? 0 : 1);
     static const int nthreads = std::max(1, env_i("STRATA_CHUNK_CPUX_THREADS", (int) std::thread::hardware_concurrency() - 4));
     namespace mmq = strata::prefill::mmq;
     Gpu& gp = *im.gpu;
@@ -7658,14 +7670,14 @@ bool cpux_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const 
     const double t0 = now_ms();
     if (!gp.cx) {
         gp.cx = std::make_unique<ChunkCpux>();
-        std::fprintf(stderr, "chunk cpux: on%s - batches up to %d tokens, experts up to %d rows, %s, %d threads, sums %s fma\n",
+        std::fprintf(stderr, "chunk cpux: on%s - batches up to %d tokens, experts up to %d rows, %s, %d threads, sum variant %d\n",
                      check ? " (CHECK: the card computes everything, the CPU's rows are compared)" : "", maxn, maxtok,
-                     link_gbs > 0 ? "share from the link rate" : "fixed share", nthreads, fma ? "with" : "without");
+                     link_gbs > 0 ? "share from the link rate" : "fixed share", nthreads, var);
     }
     ChunkCpux& c = *gp.cx;
     cpux_drop(gp);
     c.check = check;
-    c.fma = fma;
+    c.var = var;
     if (c.cls_ok.size() != gp.gll.size()) c.cls_ok.assign(gp.gll.size(), -1);
     std::vector<int32_t> cnt((size_t) NX, 0);
     for (int64_t j = 0; j < NE; ++j) {
@@ -7717,11 +7729,26 @@ bool cpux_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const 
     double took = 0;
     int32_t at = 0;
     int nfile = 0;
+    {   // the share, fewest rows first; then the experts whose down matrix takes D4 activations before the Q2_K ones
+        size_t k = 0;
+        for (; k < cand.size(); ++k) {
+            const double b = (double) im.bl[(size_t) im.g.cls(layer, cand[k])];
+            if (took + b > budget) break;
+            took += b;
+        }
+        cand.resize(k);
+        std::stable_partition(cand.begin(), cand.end(), [&](int32_t e) {
+            return cpux::act_kind(gp.gll[(size_t) im.g.cls(layer, e)].d_type) == 0;
+        });
+    }
+    int64_t nr0 = 0;
+    bool need_x[2] = { false, false };
     for (int32_t e : cand) {
         const int cl = im.g.cls(layer, e);
-        const double b = (double) im.bl[(size_t) cl];
-        if (took + b > budget) break;
-        took += b;
+        const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) cl];
+        need_x[cpux::act_kind(GL.gu_type)] = true;
+        need_x[cpux::act_kind(GL.up_type >= 0 ? GL.up_type : GL.gu_type)] = true;
+        if (cpux::act_kind(GL.d_type) == 0) nr0 += cnt[(size_t) e];
         const uint8_t* ap = gp.arena.ptr(layer, e);
         c.uidx[(size_t) e] = (int32_t) c.ue.size();
         c.ue.push_back(e);
@@ -7753,7 +7780,7 @@ bool cpux_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const 
             const int32_t q = fill[(size_t) u]++;
             rrow[q] = (int32_t) j;
             c.ent_tok[(size_t) q] = (int32_t) (j / K);
-            c.arow[(size_t) q] = q;
+            c.arow[(size_t) q] = q < nr0 ? q : q - (int32_t) nr0;   // the row of its down activation (ad / adk)
         }
     }
     // the tokens' q8_1 rows, from the card's own quantizer (the bytes mmq_launch's quantize gives each entry)
@@ -7765,17 +7792,26 @@ bool cpux_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const 
         xsrc = (const float*) c.xin.d;
         emu_hold_stream(c.s, (size_t) n * (size_t) H * 4);
     }
-    c.xq.need(mmq::q8_bytes(n, H), "cpux xq");
-    mmq::quantize(xsrc, nullptr, c.xq.d, cpux::kTypeQ20, H, H, n, c.s);
+    if (need_x[0]) {
+        c.xq.need(mmq::q8_bytes(n, H), "cpux xq");
+        mmq::quantize(xsrc, nullptr, c.xq.d, cpux::kTypeQ20, H, H, n, c.s);
+    }
+    if (need_x[1]) {
+        c.xq2.need(mmq::q8_bytes(n, H), "cpux xq2");
+        mmq::quantize(xsrc, nullptr, c.xq2.d, cpux::kTypeQ2K, H, H, n, c.s);
+    }
     ck(cudaStreamSynchronize(c.s), "cpux quantize x");
-    c.ax.build(c.xq.h, n, (int) H);
+    if (need_x[0]) c.ax.build(c.xq.h, n, (int) H);
+    if (need_x[1]) c.axk.build(c.xq2.h, n, (int) H);
     c.gu.need((size_t) nr * (size_t) (2 * FF) * 4, "cpux gu");
     c.hh.need((size_t) nr * (size_t) FF * 4, "cpux h");
-    c.xd.need(mmq::q8_bytes(nr, FF), "cpux xd");
+    if (nr0 > 0) c.xd.need(mmq::q8_bytes(nr0, FF), "cpux xd");
+    if (nr > nr0) c.xd2.need(mmq::q8_bytes(nr - nr0, FF), "cpux xd2");
     c.rows.need((size_t) nr * (size_t) H * 4, "cpux rows");
     if (!c.pool) c.pool = std::make_unique<cpux::Pool>(nthreads);
     c.layer = layer;
     c.nr = nr;
+    c.nr0 = nr0;
     c.n_file = nfile;
     c.took_gb = took / 1e9;
     c.pending = true;
@@ -7819,9 +7855,13 @@ bool cpux_collect(Ds41MoeImpl& im) {
         a = b;
     }
     emu_hold_stream(c.s, (size_t) c.nr * (size_t) (2 * FF) * 4);
-    mmq::quantize((const float*) c.hh.d, nullptr, c.xd.d, cpux::kTypeQ20, FF, FF, c.nr, c.s);
+    if (c.nr0 > 0) mmq::quantize((const float*) c.hh.d, nullptr, c.xd.d, cpux::kTypeQ20, FF, FF, c.nr0, c.s);
+    if (c.nr > c.nr0)
+        mmq::quantize((const float*) c.hh.d + (size_t) c.nr0 * (size_t) FF, nullptr, c.xd2.d, cpux::kTypeQ2K, FF, FF,
+                      c.nr - c.nr0, c.s);
     ck(cudaStreamSynchronize(c.s), "cpux swiglu");
-    c.ad.build(c.xd.h, c.nr, (int) FF);
+    if (c.nr0 > 0) c.ad.build(c.xd.h, c.nr0, (int) FF);
+    if (c.nr > c.nr0) c.adk.build(c.xd2.h, c.nr - c.nr0, (int) FF);
     const double t2 = now_ms();
     c.gpu_ms += t2 - t1;
     Ds41MoeImpl* imp = &im;
@@ -8336,9 +8376,24 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         // (m_tc_cap < want stays true), and on Windows that cudaFree / cudaMalloc pair held the card's queued
         // copies back for tens of ms a layer (STRATA_CHUNK_TL, 2026-11-21).  The re-allocation would have come
         // out at the same size unless the free VRAM had dropped under it since, so tc_max is the same.
-        static const bool tc_keep = mmq_tc_keep();
+        static const bool tc_keep = mmq_tc_keep() >= 1;
+        // STRATA_MMQ_TC_KEEP=2 (opt-in, perf-3): also a buffer SMALLER than the cap is kept, when free VRAM is what
+        // limits it.  A kept-cache turn in production mode leaves ~2.4 GiB free at this point, the buffer comes out at
+        // free - 2 GiB (about 0.4 GiB), never equals the cap, and every launch re-allocated it again (the 1.5-2 s a
+        // production short turn took over a reproducible-mode one, whose fixed borrow leaves room for the full 1 GiB).
+        // Kept when a re-allocation now would also give a usable buffer (so the run is an MMQ run either way: only the
+        // sub-run size can differ, which no sum depends on) and not more than twice this one.
+        static const bool tc_keep2 = mmq_tc_keep() >= 2;
         const size_t tc_full = std::min(want, tc_cap) / MP.SL2 * MP.SL2;
-        if (gp.m_tc_cap < want && tc_keep && gp.m_tc && gp.m_tc_cap == tc_full) {
+        bool kept2 = false;
+        if (tc_keep2 && gp.m_tc && gp.m_tc_cap >= MP.SL2 && gp.m_tc_cap < want && gp.m_tc_cap != tc_full) {
+            size_t fr = 0, tot = 0;
+            cudaMemGetInfo(&fr, &tot);
+            const size_t keep = (size_t) 2 << 30, have = fr + gp.m_tc_cap;   // (free once this buffer went back, at least)
+            const size_t now = (have > keep ? std::min(std::min(want, tc_cap), have - keep) : 0) / MP.SL2 * MP.SL2;
+            kept2 = now >= MP.SL2 && now <= 2 * gp.m_tc_cap;
+        }
+        if (kept2 || (gp.m_tc_cap < want && tc_keep && gp.m_tc && gp.m_tc_cap == tc_full)) {
             if (prof) ++g_cprof.tc_kept;
         } else if (gp.m_tc_cap < want) {
             const double ta = prof ? now_ms() : 0;
@@ -8354,7 +8409,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             else { (void) cudaGetLastError(); gp.m_tc = nullptr; }
             if (prof) { ++g_cprof.tc_realloc; g_cprof.tc_realloc_ms += now_ms() - ta; g_cprof.tc_last_gib = (double) gp.m_tc_cap / 1073741824.0; }
         }
-        if (stable) *stable = gp.m_tc && (gp.m_tc_cap >= want || (tc_keep && gp.m_tc_cap == tc_full));
+        // (STRATA_MMQ_TC_KEEP=2: a later launch may still re-allocate a VRAM-limited buffer, but only where that
+        // gives a usable one again - the pass's strided runs stay MMQ runs)
+        if (stable) *stable = gp.m_tc && (gp.m_tc_cap >= want || (tc_keep && gp.m_tc_cap == tc_full) ||
+                                          (tc_keep2 && gp.m_tc_cap >= MP.SL2));
         return gp.m_tc_cap / MP.SL2;
     };
 #endif
