@@ -1311,6 +1311,28 @@ int main(int argc, char ** argv) {
                     pv_rank.clear();
                     for (const auto & p : pv_score) pv_rank.push_back(p.first);
                     tr.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
+                    // STRATA_PF_SPEC=n (default 0 = off; STRATA_PF_SPEC_RANK=r, default 8): the same prediction names
+                    // most of this layer's file-tier experts before its attention graph runs (STRATA_XPASS_STAT on a
+                    // 3090 with a 40 GiB arena: 61-69 % of the real file-tier picks are within a token's first 8, 0.6
+                    // file-tier candidates per layer call).  The best n of them, by the union score, are read into the
+                    // stash now, so the read leads the tier call by the attention graph.  A wrong guess costs drive
+                    // time only.
+                    static const int pf_spec = std::getenv("STRATA_PF_SPEC") ? std::atoi(std::getenv("STRATA_PF_SPEC")) : 0;
+                    static const int pf_spec_rank = std::getenv("STRATA_PF_SPEC_RANK") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_PF_SPEC_RANK")))) : 8;
+                    if (pf_spec > 0) {
+                        int32_t cand[16];
+                        int nc = 0;
+                        for (const auto & p : pv_score) {   // already sorted by the union score
+                            if (nc >= pf_spec || nc >= 16) break;
+                            const int e = p.first;
+                            if (tr.resident(l, e) || tr.in_arena(l, e)) continue;
+                            bool nearby = false;   // within some token's first pf_spec_rank predictions
+                            for (int t = 0; t < m && !nearby; ++t)
+                                for (int i = 0; i < pf_spec_rank && !nearby; ++i) nearby = pv_pred[(size_t) t * 16 + i] == e;
+                            if (nearby) cand[nc++] = e;
+                        }
+                        if (nc > 0) tr.spec_read_now(l, cand, nc);
+                    }
                 }
             }
             // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the

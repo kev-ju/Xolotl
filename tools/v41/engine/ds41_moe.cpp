@@ -442,6 +442,8 @@ struct SpecStash {
             if (slot[si].layer == layer && slot[si].e == e && slot[si].seq == seq) return si;
         return -1;
     }
+    /// Slot si's address (its read may still be running: wait(si) before the bytes are used).
+    const uint8_t* slot_ptr(int si) const { return buf + (size_t) si * (size_t) stride; }
     /// Slot si's bytes once its read is done.
     const uint8_t* wait(int si) {
         std::unique_lock<std::mutex> lk(mu);
@@ -3544,6 +3546,29 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
 #endif
 }
 
+/// STRATA_PF_SPEC: speculative reads for the layer whose tier call comes NEXT (issued from its pre-attention
+/// prediction, so they lead that call by the layer's attention graph).  The host stash only; a hint.
+void Ds41MoeTier::spec_read_now(int64_t layer, const int32_t* ids, int n) {
+#if defined(DS4_MOE_CUDA)
+    Ds41MoeImpl& im = *im_;
+    if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || !ids || n <= 0) return;
+    if (layer < 0 || layer >= im.g.n_layers || !im.g.routed(layer)) return;
+    Gpu& gp = *im.gpu;
+    if (!gp.spec) {
+        gp.spec = std::make_unique<SpecStash>();
+        if (!gp.spec->open(im.blobs, im.blob)) { gp.spec.reset(); return; }
+    }
+    const int64_t seq = im.run_seq + 1;   // the next tier call is this layer's
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= im.g.n_experts || resident(layer, e) || in_arena(layer, e)) continue;
+        if (gp.spec->issue(layer, e, seq, im.run_seq)) ++im.st.spec_issued;
+    }
+#else
+    (void) layer; (void) ids; (void) n;
+#endif
+}
+
 #if defined(DS4_MOE_CUDA)
 /// STRATA_HIT_PF: prefetch()'s staging for the layer's graph hits - the list (its arming's stamp written last, after the
 /// entries) and, behind the DMAs on the prefetch stream, the copy that writes that stamp into d_rdy once they are home
@@ -5847,6 +5872,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // a blob a spec_read (STRATA_D3_SPEC) already brought in sits in the stash: the DMA sources it there, and under
     // arena_adapt it is copied into its victim slot after the DMAs are queued (fg_copy); the rest are read now
     uint8_t* fg_copy[kMaxFg] = {};
+    int fg_spec[kMaxFg], n_spec_wait = 0;   // the stash slot blob b comes from (-1: read now)
+    std::fill(fg_spec, fg_spec + kMaxFg, -1);
     int fread_b[kMaxFg], nfr = 0;
     // STRATA_P2P spec slots this call will take, collected only AFTER its own demand reads have started (a slot still
     // being read used to be waited for here, before the misses were even issued: LA_SPEC 4 lost ~8 ms/pass that way)
@@ -5914,11 +5941,15 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             continue;
         }
 #endif
-        const uint8_t* stashed = gp.spec ? gp.spec->take(layer, ue[fg_u[b]], im.run_seq) : nullptr;
-        if (stashed) {
+        // a stashed blob is not waited for here: the call's own reads start first, and the stash's read (it may
+        // still be running - STRATA_PF_SPEC issues it one attention graph ahead) is waited for together with them
+        const int ssi = gp.spec ? gp.spec->find(layer, ue[fg_u[b]], im.run_seq) : -1;
+        if (ssi >= 0) {
             ++im.st.spec_hits;
-            fg_src[b] = stashed;
+            fg_src[b] = gp.spec->slot_ptr(ssi);
             fg_copy[b] = vslot;
+            fg_spec[b] = ssi;
+            ++n_spec_wait;
         } else {
             fg_src[b] = vslot ? vslot : gp.h_fstage + (size_t) b * (size_t) B;
             fread_b[nfr++] = b;
@@ -6326,8 +6357,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     }
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
         const bool waited = nfr > 0 || n_pj > 0;
-        const double tw = (waited || npend > 0) ? now_ms() : 0.0;
+        const double tw = (waited || npend > 0 || n_spec_wait > 0) ? now_ms() : 0.0;
         if (waited) gp.rpool->wait();
+        for (int b = 0; b < nfg; ++b)
+            if (fg_spec[b] >= 0) gp.spec->wait(fg_spec[b]);
 #ifdef STRATA_XOLP2P
         for (int i = 0; i < npend; ++i) {   // the stashed blobs, now that the demand reads ran beside them
             const int b = fg_pend[i];
@@ -6337,7 +6370,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             fg_src[b] = dst;
         }
 #endif
-        if (waited || npend > 0) im.st.fwait_ms += now_ms() - tw;   // INSTRUMENT: the block on NVMe alone (not the HIT launches)
+        if (waited || npend > 0 || n_spec_wait > 0) im.st.fwait_ms += now_ms() - tw;   // INSTRUMENT: the block on NVMe alone (not the HIT launches)
         im.st.file_tier += nfg - nla;   // (STRATA_LA_ARENA's arena experts are not file-tier reads)
         im.st.file_ms += now_ms() - tfg;
     }
@@ -6383,8 +6416,26 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     }
     // stashed FILEG blobs -> their arena_adapt victim slots, on the CPU while the card runs the DMAs (both only read
     // the stash slot; the slot is not reissued before this call has returned)
+    // STRATA_SPEC_COPY_PARTS (default 8; 1 = one memcpy on this thread, the old way): a 10 MB copy on the decode
+    // thread costs about what the speculative read saved, so it is split over the read pool's workers (idle now: the
+    // call's reads are home) and waited for where the slots change hands, behind the call's own device sync.
+    static const int cp_parts = std::getenv("STRATA_SPEC_COPY_PARTS") ? std::max(1, std::min(32, std::atoi(std::getenv("STRATA_SPEC_COPY_PARTS")))) : 8;
+    int cp_b[kMaxFg], ncp = 0;
+    size_t cp_n[kMaxFg];
+    bool cp_started = false;
     for (int b = 0; b < nfg; ++b)
-        if (fg_copy[b]) std::memcpy(fg_copy[b], fg_src[b], (size_t) BLX(ue[fg_u[b]]));
+        if (fg_copy[b]) { cp_n[ncp] = (size_t) BLX(ue[fg_u[b]]); cp_b[ncp++] = b; }
+    if (ncp > 0 && cp_parts > 1) {
+        if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
+        gp.rpool->start((size_t) ncp * (size_t) cp_parts, [&](size_t r) {
+            const size_t i = r / (size_t) cp_parts, q = r % (size_t) cp_parts;
+            const size_t lo = cp_n[i] * q / (size_t) cp_parts, hi = cp_n[i] * (q + 1) / (size_t) cp_parts;
+            std::memcpy(fg_copy[cp_b[i]] + lo, fg_src[cp_b[i]] + lo, hi - lo);
+        });
+        cp_started = true;
+    } else {
+        for (int i = 0; i < ncp; ++i) std::memcpy(fg_copy[cp_b[i]], fg_src[cp_b[i]], cp_n[i]);
+    }
     xmark(2);
     // ---- the pool on the CPU misses: one job per distinct expert (split into jobs of <= cpu::MAXT tokens, kJobSplit),
     // its class's fmt + per-(token,class) quant ----
@@ -6627,6 +6678,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             ++im.admitted;
         }
     }
+    if (cp_started) gp.rpool->wait();   // the stashed blobs are in their victim slots
     // arena_adapt: the stream is synced above (every DMA out of a victim slot is done) - the slots change hands
     int32_t fg_slot[kMaxFg];
     for (int b = 0; b < nfg; ++b)   // (a deferred blob's slot changes hands in the call that adds it, below)
