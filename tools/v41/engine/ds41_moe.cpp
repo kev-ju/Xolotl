@@ -5676,6 +5676,50 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
 /// `out_dev != nullptr` = the weighted sum on the card, per token (bit-identical to nt run_to_dev calls);
 /// `out_dev == nullptr` = the host sum into `out`.  Q2_0-native classes batch too: their CPU jobs read a per-token
 /// ActQ (act_quant_any), the rest a native act slot.
+// STRATA_POOL_AHEAD=1 (opt-in; the same jobs, the same rows): gpu_run_n_ex hands the layer's CPU-pool batch to a helper
+// thread BEFORE it launches the card's work, and collects it where the batch used to run.  The pool's ~0.25 ms a call
+// then runs beside the ~0.3 ms the host spends issuing the launches (and beside the file-tier reads' wait) instead of
+// after them.  The pool reads the routed arena experts and the host copy of the activations; nothing the launches do
+// writes either (an arena_adapt victim, a vram_lru demotion target and a stash copy are never a CPU-class expert of
+// this call).  One job at a time; the thread is never joined (it lives as long as the process).
+struct PoolAhead {
+    std::atomic<uint32_t> state{0};   // 0 idle, 1 posted, 2 done
+    std::function<void()> fn;
+    bool started = false;
+    void post(std::function<void()> f) {
+        if (!started) {
+            started = true;
+            std::thread([this] {
+                for (;;) {
+                    const uint32_t s = state.load(std::memory_order_acquire);
+                    if (s != 1) { state.wait(s, std::memory_order_acquire); continue; }
+                    fn();
+                    state.store(2, std::memory_order_release);
+                    state.notify_all();
+                }
+            }).detach();
+        }
+        fn = std::move(f);
+        state.store(1, std::memory_order_release);
+        state.notify_all();
+    }
+    void collect() {
+        for (int i = 0; state.load(std::memory_order_acquire) != 2; ++i) {
+            if (i < 200000) ds41_remote_pause();
+            else state.wait(1, std::memory_order_acquire);
+        }
+        state.store(0, std::memory_order_release);
+    }
+};
+static PoolAhead& pool_ahead_worker() {
+    static PoolAhead* w = new PoolAhead();   // never destroyed: its thread may be parked at exit
+    return *w;
+}
+static bool pool_ahead_on() {
+    static const bool on = std::getenv("STRATA_POOL_AHEAD") && std::getenv("STRATA_POOL_AHEAD")[0] == '1';
+    return on;
+}
+
 bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w,
                   const float* x_host, float* out, void* out_dev) {
     Gpu& gp = *im.gpu;
@@ -5704,6 +5748,13 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     static double xpool0[3] = {};
     static int64_t xpool_b0 = 0;
     static long xp_n = 0, xp_nu = 0, xp_cpu = 0, xp_file = 0;
+    // DS41_PROF_X=3 (adds timing events to decode-sized calls): the card's own time for the call - the grouped
+    // launches' kernels (event pairs, summed), and the span from the call's first launch to the end of its sum
+    static double xp_kern = 0, xp_span = 0;
+    static long xp_launches = 0;
+    const bool xgpu = xprof && xprof_mode >= 3;
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> xev;
+    cudaEvent_t xe0 = nullptr, xe1 = nullptr;
     double xt = xprof ? now_ms() : 0;
     auto xmark = [&](int i) { if (xprof) { const double t = now_ms(); xp[i] += t - xt; xt = t; } };
 
@@ -6186,11 +6237,14 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
            "grp meta");
         meta_at = o_end;
         uint8_t* dm = (uint8_t*) gp.d_meta;
+        cudaEvent_t ke0 = nullptr, ke1 = nullptr;
+        if (xgpu) { cudaEventCreate(&ke0); cudaEventCreate(&ke1); cudaEventRecord(ke0, gp.s); }
         strata::kernels::native_expert_grouped(gp.gll[(size_t) c], (const unsigned long long*) (dm + o_ptr),
                                               (const int32_t*) (dm + o_st), (const int32_t*) (dm + o_ng),
                                               (const int32_t*) (dm + o_dst), (const int32_t*) (dm + o_tok), ng,
                                               (int64_t) ne, xq ? xq : gp.d_xq, gp.d_scratch,
                                               parts_out ? parts_out : (float*) gp.d_parts, gp.s, ng);
+        if (xgpu) { cudaEventRecord(ke1, gp.s); xev.emplace_back(ke0, ke1); }
     };
     // ---- one grouped launch per (site, class); groups = distinct experts, entries = the tokens routing to them.
     // The PCIe site (arena misses + FILEG) DMAs into the kMaxParts d_stage slots IN WAVES: when the slots run out
@@ -6334,6 +6388,70 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             else launch_group(c, ptr, start, dst, tok);
         }
     };
+    // ---- the pool's jobs for the CPU misses (built here so STRATA_POOL_AHEAD can start them before the launches): one
+    // job per distinct expert (split into jobs of <= cpu::MAXT tokens, kJobSplit), its class's fmt + per-(token,class) quant
+    int nj = 0, ns = 0;   // ns: the distinct CPU experts so far (acquire's staging slot; a split job shares its blob)
+    auto pool_prep = [&]() {
+    { int nc = 0; for (int u = 0; u < nu; ++u) nc += cls[u] == CPU; reserve_ftmp(im, nc); }
+    if ((int) im.jobs.size() < nu * kJobSplit) im.jobs.resize((size_t) nu * kJobSplit);
+    std::vector<char> act_done(im.nact_multi_act.size() * (size_t) kMaxTok, 0);
+    bool q2_done[kMaxTok] = {};   // a Q2_0-class job reads the token's ActQ (act_quant_any), not a native act slot
+    for (int u = 0; u < nu; ++u) {
+        if (cls[u] != CPU) continue;
+        const cpu::NativeFmt& fc = im.fl[(size_t) im.g.cls(layer, ue[u])];
+        bool from_file = false;
+        const uint8_t* blob = acquire(im, layer, ue[u], ns++, &from_file);
+        cpu::ExpertJobMulti* jb = nullptr;
+        for (int j = 0; j < NE; ++j) {
+            if (ent_u[j] != u) continue;
+            if (!jb || jb->nt == cpu::MAXT) {   // a new job: the first slice, or the previous one is full
+                jb = &im.jobs[(size_t) nj++];
+                jb->blob = blob;
+                jb->nt = 0;
+                jb->fmt = &fc;
+                for (int t = 0; t < cpu::MAXT; ++t) { jb->nact[t] = nullptr; jb->out[t] = nullptr; jb->act[t] = nullptr; }
+            }
+            const int tt = j / (int) K;
+            if (cpu::q2_native_kernels(fc.gu_type)) {
+                if (!q2_done[tt]) { cpu::act_quant_any(gp.h_x + (size_t) tt * H, (int) fc.n_embd, im.actq_n[(size_t) tt]); q2_done[tt] = true; }
+                jb->act[jb->nt] = &im.actq_n[(size_t) tt];
+            } else {
+                uint8_t* slot = nact_slot_n(im, tt, fc.gu_act);
+                const size_t ai = (size_t) tt * im.nact_multi_act.size() + (size_t) std::max(0, nact_act_idx(im, fc.gu_act));
+                if (!act_done[ai]) {
+                    cpu::native_quant_act(fc, gp.h_x + (size_t) tt * H, slot);
+                    act_done[ai] = 1;
+                }
+                jb->nact[jb->nt] = slot;
+            }
+            jb->out[jb->nt] = im.parts_n.data() + (size_t) j * (size_t) H;
+            ++jb->nt;
+        }
+    }
+    };
+    // (STRATA_FILE_GPU=0 or more file-tier misses than kMaxFg: a CPU job would read the file in acquire - not ahead then)
+    bool ahead = pool_ahead_on();
+    for (int u = 0; u < nu && ahead; ++u)
+        if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u])) ahead = false;
+    double ahead_ms = 0;
+    bool ahead_posted = false;
+    if (ahead) {
+        pool_prep();
+        if (nj > 0) {
+            const cpu::NativeFmt* f0 = &im.fl[(size_t) im.g.cls(layer, ue[0])];
+            cpu::ExpertJobMulti* jp = im.jobs.data();
+            cpu::ExpertPool* pl = im.pool.get();
+            const int njv = nj;
+            double* msp = &ahead_ms;
+            pool_ahead_worker().post([pl, f0, jp, njv, msp] {
+                const double c0 = now_ms();
+                pl->run_split_multi_native(*f0, jp, njv);
+                *msp = now_ms() - c0;
+            });
+            ahead_posted = true;
+        }
+    }
+    if (xgpu) { cudaEventCreate(&xe0); cudaEventCreate(&xe1); cudaEventRecord(xe0, gp.s); }
     launch_site(HIT);
     // vram_lru, as gpu_run: a prefetched expert the pass used is copied device-to-device into a victim slot (the
     // hits kernel above read the staging copy; this copy only reads it too, and the next prefetch waits for the sync)
@@ -6438,45 +6556,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         for (int i = 0; i < ncp; ++i) std::memcpy(fg_copy[cp_b[i]], fg_src[cp_b[i]], cp_n[i]);
     }
     xmark(2);
-    // ---- the pool on the CPU misses: one job per distinct expert (split into jobs of <= cpu::MAXT tokens, kJobSplit),
-    // its class's fmt + per-(token,class) quant ----
-    int nj = 0, ns = 0;   // ns: the distinct CPU experts so far (acquire's staging slot; a split job shares its blob)
-    { int nc = 0; for (int u = 0; u < nu; ++u) nc += cls[u] == CPU; reserve_ftmp(im, nc); }
-    if ((int) im.jobs.size() < nu * kJobSplit) im.jobs.resize((size_t) nu * kJobSplit);
-    std::vector<char> act_done(im.nact_multi_act.size() * (size_t) kMaxTok, 0);
-    bool q2_done[kMaxTok] = {};   // a Q2_0-class job reads the token's ActQ (act_quant_any), not a native act slot
-    for (int u = 0; u < nu; ++u) {
-        if (cls[u] != CPU) continue;
-        const cpu::NativeFmt& fc = im.fl[(size_t) im.g.cls(layer, ue[u])];
-        bool from_file = false;
-        const uint8_t* blob = acquire(im, layer, ue[u], ns++, &from_file);
-        cpu::ExpertJobMulti* jb = nullptr;
-        for (int j = 0; j < NE; ++j) {
-            if (ent_u[j] != u) continue;
-            if (!jb || jb->nt == cpu::MAXT) {   // a new job: the first slice, or the previous one is full
-                jb = &im.jobs[(size_t) nj++];
-                jb->blob = blob;
-                jb->nt = 0;
-                jb->fmt = &fc;
-                for (int t = 0; t < cpu::MAXT; ++t) { jb->nact[t] = nullptr; jb->out[t] = nullptr; jb->act[t] = nullptr; }
-            }
-            const int tt = j / (int) K;
-            if (cpu::q2_native_kernels(fc.gu_type)) {
-                if (!q2_done[tt]) { cpu::act_quant_any(gp.h_x + (size_t) tt * H, (int) fc.n_embd, im.actq_n[(size_t) tt]); q2_done[tt] = true; }
-                jb->act[jb->nt] = &im.actq_n[(size_t) tt];
-            } else {
-                uint8_t* slot = nact_slot_n(im, tt, fc.gu_act);
-                const size_t ai = (size_t) tt * im.nact_multi_act.size() + (size_t) std::max(0, nact_act_idx(im, fc.gu_act));
-                if (!act_done[ai]) {
-                    cpu::native_quant_act(fc, gp.h_x + (size_t) tt * H, slot);
-                    act_done[ai] = 1;
-                }
-                jb->nact[jb->nt] = slot;
-            }
-            jb->out[jb->nt] = im.parts_n.data() + (size_t) j * (size_t) H;
-            ++jb->nt;
-        }
-    }
+    // ---- the pool on the CPU misses (pool_prep, above the launches) ----
+    if (!ahead) pool_prep();
     if (nj > 0 && std::getenv("DS41_DBG_X")) {
         std::fprintf(stderr, "[dbg_x] nt=%d nu=%d nj=%d nact_multi_n=%zu nfmt=%zu\n", nt, nu, nj,
                      im.nact_multi_n.size(), im.nact_multi_act.size());
@@ -6489,7 +6570,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     }
     xmark(3);
-    if (nj > 0) {
+    if (ahead_posted) {
+        pool_ahead_worker().collect();
+        st.cpu_ms = ahead_ms;
+    } else if (nj > 0) {
         const double c0 = now_ms();
         im.pool->run_split_multi_native(im.fl[(size_t) im.g.cls(layer, ue[0])], im.jobs.data(), nj);
         st.cpu_ms = now_ms() - c0;
@@ -6608,6 +6692,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 std::fprintf(stderr, "ds41_moe: STRATA_FILE_DEFER=%d: %lld layer calls, %lld experts deferred, %lld dropped\n",
                              defer_r, (long long) im.fdef_layers, (long long) im.fdef_experts, (long long) im.fdef_dropped);
         }
+        if (xgpu) cudaEventRecord(xe1, gp.s);
         ck(cudaStreamSynchronize(gp.s), "sum sync");
     } else {
         ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
@@ -6729,6 +6814,19 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             }
         }
     }
+    if (xgpu) {
+        float ms = 0;
+        if (xe1 && cudaEventElapsedTime(&ms, xe0, xe1) == cudaSuccess) xp_span += ms;
+        (void) cudaGetLastError();
+        for (auto& e : xev) {
+            if (cudaEventElapsedTime(&ms, e.first, e.second) == cudaSuccess) xp_kern += ms;
+            cudaEventDestroy(e.first);
+            cudaEventDestroy(e.second);
+        }
+        xp_launches += (long) xev.size();
+        if (xe0) cudaEventDestroy(xe0);
+        if (xe1) cudaEventDestroy(xe1);
+    }
     if (xprof) {
         xmark(6);
         ++xp_n; xp_nu += nu;
@@ -6738,6 +6836,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                          "sum+sync %.3f admit %.3f | distinct %.2f/call, cpu %.2f, file %.2f\n", xp_n, xp[0] / xp_n,
                          xp[1] / xp_n, xp[2] / xp_n, xp[3] / xp_n, xp[4] / xp_n, xp[5] / xp_n, xp[6] / xp_n,
                          (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n);
+            if (xgpu)
+                std::fprintf(stderr, "[prof_x] card: %.2f grouped launches/call, their kernels %.3f ms/call; first launch to the end of the sum %.3f ms/call\n",
+                             (double) xp_launches / xp_n, xp_kern / xp_n, xp_span / xp_n);
             // the pool's own phases since the last print: gate/up, the ff quant, down, and its weight-read rate
             const cpu::ExpertPool& pl = *im.pool;
             const double g = pl.ms_multi_gu - xpool0[0], q = pl.ms_multi_q - xpool0[1], d = pl.ms_multi_down - xpool0[2];
