@@ -610,6 +610,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
         }
         tables_.push_back(t);
     }
+    if (const char * env = std::getenv("STRATA_ENG_THREADS")) threads = std::max(1, std::min(256, std::atoi(env)));
     for (int i = 0; i < std::max(1, threads); ++i)       // the pool is the disk's queue depth
         workers_.emplace_back([this] { pump(); });
     nthreads_ = (int64_t) workers_.size();
@@ -762,6 +763,7 @@ struct Ds41Engram::Batch {
     struct Hit { int32_t e; uint32_t k; const uint8_t * w; };
     std::vector<Hit> hits;
     std::shared_ptr<Task> read_task;
+    std::shared_ptr<Task> read_task1;                 // STRATA_ENG_SPLIT: slot 1's reads and rows (read_task: slot 0's)
     std::atomic<int> bad { 0 };
     std::atomic<uint64_t> bytes { 0 };
 };
@@ -783,7 +785,8 @@ void Ds41Engram::drop_cache() {
     }
 }
 
-std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err) {
+std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err,
+                                                     bool split) {
     const int64_t nel = (int64_t) tables_.size();
     if (nel == 0) { err = "engram: no tables"; return nullptr; }
     if (n <= 0) { err = "engram: empty batch"; return nullptr; }
@@ -791,7 +794,7 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
     std::vector<int64_t> ids((size_t) (nel * m));
     for (int64_t e = 0; e < nel; ++e)
         for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) ((e * n + t) * cols_)]);
-    return start_ids(ids, n, out, err);
+    return start_ids(ids, n, out, err, split);
 }
 
 bool Ds41Engram::rows_at(const int * slot, const int64_t * pos, int n, std::vector<std::vector<float>> & out, std::string & err) {
@@ -809,7 +812,7 @@ bool Ds41Engram::rows_at(const int * slot, const int64_t * pos, int n, std::vect
 
 // The reads of n rows' hash ids (ids[(e * n + t) * cols + c], every Engram slot e): start() and rows_at().
 std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_ids(std::vector<int64_t> & ids, int n, std::vector<std::vector<float>> & out,
-                                                         std::string & err) {
+                                                         std::string & err, bool split) {
     const int64_t nel = (int64_t) tables_.size();
     auto b = std::make_shared<Batch>();
     b->n = n;
@@ -886,14 +889,27 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_ids(std::vector<int64_t> & 
         auto t = std::make_shared<Task>();
         const int64_t ng = (int64_t) b->groups.size();
         constexpr int64_t HIT_CHUNK = 64;            // hits per work item
-        t->n = ng + ((int64_t) b->hits.size() + HIT_CHUNK - 1) / HIT_CHUNK;
+        // The work items: the read groups (slot 0's first: the loop above fills them slot by slot), then the in-RAM
+        // rows in chunks that never span two slots (slot 0's hits are hits[0, hs), in nh0 chunks).
+        int64_t ng0 = 0;
+        while (ng0 < ng && b->groups[(size_t) ng0].e == 0) ++ng0;
+        size_t hs = 0;
+        while (hs < b->hits.size() && b->hits[hs].e == 0) ++hs;
+        const int64_t nh0 = ((int64_t) hs + HIT_CHUNK - 1) / HIT_CHUNK;
+        const int64_t nh1 = ((int64_t) (b->hits.size() - hs) + HIT_CHUNK - 1) / HIT_CHUNK;
+        t->n = ng + nh0 + nh1;
         Batch * bp = b.get();
-        t->fn = [this, bp, dim, wb, srsz, ng](int64_t a, int64_t c) {
+        // A task's item i is work item id0 + i for its first m0 items and id1 + (i - m0) after them: one task takes
+        // every item in order; under STRATA_ENG_SPLIT a prompt-sized batch has two tasks, slot 0's items and slot 1's.
+        auto work = [this, bp, dim, wb, srsz, ng, nh0, hs](int64_t a, int64_t c, int64_t m0, int64_t id0, int64_t id1) {
             uint8_t bw[4096 + 512], bs[1024];
             auto & outv = *bp->out;
-            for (int64_t g = a; g < c; ++g) {
+            for (int64_t i = a; i < c; ++i) {
+                const int64_t g = i < m0 ? id0 + i : id1 + (i - m0);
                 if (g >= ng) {                       // a chunk of in-RAM rows: dequantize into the first slot, copy to the rest
-                    const size_t h0 = (size_t) (g - ng) * HIT_CHUNK, h1 = std::min(bp->hits.size(), h0 + HIT_CHUNK);
+                    const int64_t hc = g - ng;
+                    const size_t h0 = hc < nh0 ? (size_t) hc * HIT_CHUNK : hs + (size_t) (hc - nh0) * HIT_CHUNK;
+                    const size_t h1 = std::min(hc < nh0 ? hs : bp->hits.size(), h0 + HIT_CHUNK);
                     for (size_t h = h0; h < h1; ++h) {
                         const Batch::Hit & H = bp->hits[h];
                         const auto & pk = bp->packed[(size_t) H.e];
@@ -942,20 +958,42 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_ids(std::vector<int64_t> & 
         b->read_task = t;
         if (nthreads_ <= 0 || t->n < 4) {            // tiny batch: run on the caller, no queue round-trip.  (Was n <= 2 *
                                                      // nthreads: a decode token's ~48 preads then ran serially, ~11 ms cold.)
+            t->fn = [work, ng](int64_t a, int64_t c) { work(a, c, ng, 0, ng); };
             t->parts = 1;
             t->pending.store(1);
             t->fn(0, t->n);
             t->done();
+        } else if (split && nel == 2 && ng0 + nh0 > 0 && (ng - ng0) + nh1 > 0) {
+            // slot 0's jobs are queued first, so the pool reads the first Engram layer's rows before the second's
+            auto t1 = std::make_shared<Task>();
+            t->n = ng0 + nh0;
+            t->fn = [work, ng, ng0](int64_t a, int64_t c) { work(a, c, ng0, 0, ng); };
+            t1->n = (ng - ng0) + nh1;
+            t1->fn = [work, ng, ng0, nh0](int64_t a, int64_t c) { work(a, c, ng - ng0, ng0, ng + nh0); };
+            b->read_task1 = t1;
+            fire(t, std::min<int64_t>(t->n, 8 * nthreads_));
+            fire(t1, std::min<int64_t>(t1->n, 8 * nthreads_));
         } else {
+            t->fn = [work, ng](int64_t a, int64_t c) { work(a, c, ng, 0, ng); };
             fire(t, std::min<int64_t>(t->n, 8 * nthreads_));
         }
     }
     return b;
 }
 
+bool Ds41Engram::wait_slot0(const std::shared_ptr<Batch> & b, std::string & err) {
+    if (!b) { err = "engram: null batch"; return false; }
+    if (b->read_task) b->read_task->wait();
+    if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }
+    return true;
+}
+
+bool Ds41Engram::is_split(const std::shared_ptr<Batch> & b) const { return b && b->read_task1; }
+
 bool Ds41Engram::wait(const std::shared_ptr<Batch> & b, std::string & err) {
     if (!b) { err = "engram: null batch"; return false; }
     if (b->read_task) b->read_task->wait();
+    if (b->read_task1) b->read_task1->wait();
     reads_ += (uint64_t) b->groups.size();
     bytes_ += b->bytes.load();
     if (b->bad.load()) { err = "engram: " + std::to_string(b->bad.load()) + " row reads failed"; return false; }

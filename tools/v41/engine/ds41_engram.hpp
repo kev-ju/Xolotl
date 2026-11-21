@@ -87,8 +87,12 @@ public:
     /// finish and reports errors.  `out` must stay alive and untouched until wait() returns - it is the destination, not
     /// a copy.  Lets a caller overlap a pass's reads with unrelated work (the dense half knows all hashes at begin()).
     struct Batch;
-    std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err);
+    /// split (STRATA_ENG_SPLIT): slot 0's rows (the first Engram layer's) are read first and can be waited for alone
+    /// with wait_slot0(), while slot 1's reads go on; wait() still waits for everything.  Same rows, same bytes.
+    std::shared_ptr<Batch> start(int64_t pos0, int n, std::vector<std::vector<float>> & out, std::string & err, bool split = false);
     bool wait(const std::shared_ptr<Batch> & b, std::string & err);
+    bool wait_slot0(const std::shared_ptr<Batch> & b, std::string & err);
+    bool is_split(const std::shared_ptr<Batch> & b) const;   ///< the batch has a slot-1 task of its own
     /// Drop this module's tables from the page cache (posix_fadvise DONTNEED on our own fds; not a global drop).
     void drop_cache();
     /// bytes read so far (stats)
@@ -137,7 +141,8 @@ private:
     int hist_cur_ = 0;
     std::vector<int64_t> & hist_of(int s);
     void hash_in(const std::vector<int64_t> & h, int64_t pos, int e, int64_t * out) const;
-    std::shared_ptr<Batch> start_ids(std::vector<int64_t> & ids, int n, std::vector<std::vector<float>> & out, std::string & err);
+    std::shared_ptr<Batch> start_ids(std::vector<int64_t> & ids, int n, std::vector<std::vector<float>> & out, std::string & err,
+                                     bool split = false);
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
     // the Q6_K tables (qtype_ 14) from a GGUF's per_layer_token_embd.weight (Unsloth / llama.cpp #30817's layout)

@@ -456,6 +456,7 @@ struct Ds41Dense::Impl {
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
+    bool eng_up0 = false;                 // STRATA_ENG_SPLIT: eng_batch's slot-0 rows are on the card already
     // STRATA_DS41_ENGRAM_AHEAD (default on): the NEXT prompt chunk's reads (engram_next), started into eng_rows once this pass's
     // rows are on the card (engram_ready), so they run beside this chunk's layers 1.. instead of only layer 0
     std::shared_ptr<Ds41Engram::Batch> eng_ahead;
@@ -2920,11 +2921,36 @@ static bool engram_ahead_on() {
     return on;
 }
 
-static bool engram_ready(Ds41Dense::Impl & im) {
+// STRATA_ENG_SPLIT=1 (opt-in, the same bytes): a pass's reads are two tasks, the first Engram layer's rows (slot 0) and
+// the second's (slot 1).  The first Engram layer waits for and uploads slot 0 only (eslot 0); slot 1's reads go on
+// under the layers between the two and are waited for at the second Engram layer, or by whatever flushes the batch.
+// 2026-11-21, 3090 / Windows, cold tables read unbuffered: the first chunk of a 13.9K prompt waits for half the reads.
+static bool engram_split_on() {
+    static const bool on = std::getenv("STRATA_ENG_SPLIT") && std::getenv("STRATA_ENG_SPLIT")[0] == '1';
+    return on;
+}
+
+static bool engram_ready(Ds41Dense::Impl & im, int64_t eslot = -1) {
     if (!im.eng_batch) return true;
     // STRATA_ENG_PROF: how long the first Engram layer waits here for the pass's reads (STRATA_ENG_ASYNC's decode wait)
     static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
     const auto tw = eprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (eslot == 0 && im.engram.is_split(im.eng_batch)) {
+        if (im.eng_up0) return true;
+        if (!im.engram.wait_slot0(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
+        if (!im.eng_rows.empty())
+            ggml_backend_tensor_set(im.i_eng[0], im.eng_rows[0].data(), 0, im.eng_rows[0].size() * 4);
+        im.eng_up0 = true;
+        if (eprof) {
+            static double s_ms = 0; static long s_n = 0;
+            s_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+            if (++s_n % 256 == 0 || im.eng_rows[0].size() > (size_t) 1 << 22)
+                std::fprintf(stderr, "engram split: slot 0 waited and uploaded, %.3f ms/pass over %ld passes\n", s_ms / (double) s_n, s_n);
+        }
+        return true;
+    }
+    const bool up0 = im.eng_up0;
+    im.eng_up0 = false;
     if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
     if (eprof) {
         static double w_ms = 0, w_max = 0;
@@ -2938,7 +2964,7 @@ static bool engram_ready(Ds41Dense::Impl & im) {
                          w_ms / (double) w_n, w_n, w_hit, w_max);
     }
     im.eng_batch.reset();
-    for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
+    for (size_t e = up0 ? 1 : 0; e < im.eng_rows.size() && e < 2; ++e)
         ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
     // STRATA_DS41_ENGRAM_AHEAD: eng_rows is free again (the copy above is synchronous): the next chunk's reads go
     // into it now.  Its tokens are recorded first (positions past this pass: they take no part in this pass's hashes,
@@ -2946,7 +2972,7 @@ static bool engram_ready(Ds41Dense::Impl & im) {
     if (engram_ahead_on() && !im.eng_next_tids.empty() && !im.vision && !im.eng_ahead) {
         const int nn = (int) im.eng_next_tids.size();
         for (int t = 0; t < nn; ++t) im.engram.set_token(im.eng_next_pos0 + t, im.eng_next_tids[(size_t) t]);
-        im.eng_ahead = im.engram.start(im.eng_next_pos0, nn, im.eng_rows, im.err);
+        im.eng_ahead = im.engram.start(im.eng_next_pos0, nn, im.eng_rows, im.err, engram_split_on());
         if (!im.eng_ahead) return false;
         im.eng_ahead_pos0 = im.eng_next_pos0;
         im.eng_ahead_n = nn;
@@ -3163,7 +3189,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0, bool pack
             for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
                 ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
         } else if (!ahead_hit) {
-            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err, engram_split_on());
             if (!im.eng_batch) return false;
         }
     }
@@ -3498,7 +3524,7 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
 
 static bool span_kv_one(Ds41Dense::Impl & im, int il, int col0, int n) {
     if (!upload_span(im, col0, n)) return false;
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // the Engram add feeds this layer's K/V
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, im.ly[(size_t) il].eslot)) return false;   // the Engram add feeds this layer's K/V
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params pk = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gck = ggml_init(pk);
@@ -3535,7 +3561,7 @@ static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n) {
     if (!upload_span(im, col0, n)) return false;
     if (g_dprof_on && dprof_now() - tp > 50) std::fprintf(stderr, "dense prof: slow upload_span layer %d col0 %d n %d: %.0f ms\n", il, col0, n, dprof_now() - tp);
     lap(6);
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // wait the pass's Engram reads here
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, im.ly[(size_t) il].eslot)) return false;   // wait the pass's Engram reads here
     lap(3);
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
@@ -3672,7 +3698,7 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     }
     // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
     // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.
-    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im, im.ly[(size_t) il].eslot)) return false;
     const int64_t r = im.ly[(size_t) il].ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     ggml_cgraph * gf = nullptr;
@@ -3912,7 +3938,7 @@ bool Ds41Dense::finish_predict_attn(int il, const float * routed_sum, int next_i
         ggml_backend_event_record(im.ev_pred, im.backend);
     }
     // the next layer, queued behind it (an Engram layer's rows are uploaded first, as attn_router does)
-    if (im.ly[(size_t) next_il].eslot >= 0 && !engram_ready(im)) return false;
+    if (im.ly[(size_t) next_il].eslot >= 0 && !engram_ready(im, im.ly[(size_t) next_il].eslot)) return false;
     if (hooked) *im.rb_flag_route = 0;
     if (!im.compute(ga->second, true, true)) return false;
     if (!hooked) {
