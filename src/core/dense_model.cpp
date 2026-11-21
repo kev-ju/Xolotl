@@ -85,7 +85,9 @@ const SpillApi& spill_api() {
         }
         int vmm = 0, host_vmm = 0, numa = -1;
         attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+#if CUDA_VERSION >= 13000
         attr(&host_vmm, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+#endif  // CUDA 12 headers lack the attribute (#138): host_vmm stays 0 and the KV spill reports why
         attr(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, (CUdevice) a.dev);
         if (!vmm || !host_vmm) { a.why = "this GPU/driver cannot map host memory through the virtual memory API"; return; }
         a.host.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
