@@ -1344,6 +1344,69 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!d.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = d.last_error(); return false; }
             lap(0);
+            // STRATA_XPASS_STAT=1 (diagnostic, no behaviour change): would the PREVIOUS pass have named this pass's
+            // file-tier experts?  Per layer, the previous pass's guesses - (a) the union of its tokens' predicted top 16
+            // for this layer (predict_multi, what the D3 prefetch already computes), (b) with STRATA_LA2 the union of
+            // its two-ahead guesses for this layer - are scored against this pass's real file-tier picks: the share
+            // covered, and how many file-tier experts each guess set names per layer (the reads it would cost).
+            {
+                static const bool xp_stat = std::getenv("STRATA_XPASS_STAT") != nullptr;
+                if (xp_stat) {
+                    static std::vector<std::vector<int>> xp_pred((size_t) n_layer), xp_la2((size_t) n_layer), xp_cur_la2((size_t) n_layer);
+                    static std::vector<std::vector<int>> xp_pred_last((size_t) n_layer);   // the last token's top 16 only
+                    static long xp_calls = 0, xp_file = 0, xp_cov_pred = 0, xp_cov_last = 0, xp_cov_la2 = 0, xp_cov_any = 0;
+                    static long xp_cand_pred = 0, xp_cand_last = 0, xp_cand_la2 = 0, xp_have_pred = 0, xp_have_la2 = 0;
+                    auto has = [](const std::vector<int> & v, int e) { return std::find(v.begin(), v.end(), e) != v.end(); };
+                    auto is_file = [&](int e) { return e >= 0 && !tr.resident(l, e) && !tr.in_arena(l, e); };
+                    std::vector<int> seen;
+                    for (int t = 0; t < m; ++t)
+                        for (int k = 0; k < top_k; ++k) {
+                            const int e = mids[(size_t) t * top_k + k];
+                            if (!is_file(e) || has(seen, e)) continue;
+                            seen.push_back(e);
+                            ++xp_file;
+                            const bool a = has(xp_pred[(size_t) l], e), b = has(xp_la2[(size_t) l], e);
+                            xp_cov_pred += a; xp_cov_la2 += b; xp_cov_any += a || b;
+                            xp_cov_last += has(xp_pred_last[(size_t) l], e);
+                        }
+                    for (int e : xp_pred[(size_t) l]) xp_cand_pred += is_file(e);
+                    for (int e : xp_pred_last[(size_t) l]) xp_cand_last += is_file(e);
+                    for (int e : xp_la2[(size_t) l]) xp_cand_la2 += is_file(e);
+                    xp_have_pred += !xp_pred[(size_t) l].empty();
+                    xp_have_la2 += !xp_la2[(size_t) l].empty();
+                    // this pass's guesses, for the next pass
+                    xp_pred[(size_t) l].clear();
+                    xp_pred_last[(size_t) l].clear();
+                    if (pf_now && pv_pred.size() >= (size_t) m * 16) {
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < 16; ++i) {
+                                const int e = pv_pred[(size_t) t * 16 + i];
+                                if (e >= 0 && !has(xp_pred[(size_t) l], e)) xp_pred[(size_t) l].push_back(e);
+                                if (e >= 0 && t == m - 1) xp_pred_last[(size_t) l].push_back(e);
+                            }
+                    }
+                    xp_la2[(size_t) l].swap(xp_cur_la2[(size_t) l]);   // what layer l - 2 guessed for l in this pass
+                    xp_cur_la2[(size_t) l].clear();
+                    if (const int * g2 = d.lookahead2_ids(); g2 && l + 2 < n_layer) {
+                        const int W = d.lookahead2_width();
+                        std::vector<int> & dst = xp_cur_la2[(size_t) l + 2];
+                        dst.clear();
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < W; ++i) {
+                                const int e = g2[(size_t) t * W + i];
+                                if (e >= 0 && !has(dst, e)) dst.push_back(e);
+                            }
+                    }
+                    if (++xp_calls % 1600 == 0)
+                        std::fprintf(stderr, "[xpass] %ld layer calls, %ld real file-tier picks | the previous pass named: predicted top 16 of all its "
+                                     "tokens %.1f%% (%.2f file-tier candidates per layer call), of its last token %.1f%% (%.2f), two-ahead guesses "
+                                     "%.1f%% (%.2f), either %.1f%% | layer calls with a guess: predict %ld, la2 %ld\n", xp_calls, xp_file,
+                                     xp_file ? 100.0 * xp_cov_pred / xp_file : 0.0, (double) xp_cand_pred / xp_calls,
+                                     xp_file ? 100.0 * xp_cov_last / xp_file : 0.0, (double) xp_cand_last / xp_calls,
+                                     xp_file ? 100.0 * xp_cov_la2 / xp_file : 0.0, (double) xp_cand_la2 / xp_calls,
+                                     xp_file ? 100.0 * xp_cov_any / xp_file : 0.0, xp_have_pred, xp_have_la2);
+                }
+            }
             if (d3_src_la2 && rdev && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + 2 < stage_end) {
                 if (const int * la2 = d.lookahead2_ids()) {
                     // only the NVMe-tier experts among the pass tokens' guesses, scored W - rank summed over the tokens
