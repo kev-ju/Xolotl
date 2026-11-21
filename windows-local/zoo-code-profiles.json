@@ -1,0 +1,64 @@
+{
+  "providerProfiles": {
+    "currentApiConfigName": "xolotl-qfn45",
+    "apiConfigs": {
+      "xolotl-qfn45": {
+        "id": "xolotlqfn45",
+        "apiProvider": "openai",
+        "openAiBaseUrl": "http://127.0.0.1:8099/v1",
+        "openAiApiKey": "local",
+        "openAiModelId": "qfn45",
+        "openAiStreamingEnabled": true,
+        "openAiStrictToolSchemas": false,
+        "openAiR1FormatEnabled": false,
+        "openAiUseAzure": false,
+        "includeMaxTokens": true,
+        "modelMaxTokens": 65536,
+        "enableReasoningEffort": false,
+        "openAiCustomModelInfo": {
+          "contextWindow": 262144,
+          "maxTokens": 65536,
+          "supportsImages": false,
+          "supportsPromptCache": false,
+          "supportsToolCalling": true,
+          "inputPrice": 0,
+          "outputPrice": 0
+        }
+      },
+      "xolotl-dsv41": {
+        "id": "xolotldsv41",
+        "apiProvider": "openai",
+        "openAiBaseUrl": "http://127.0.0.1:8150/v1",
+        "openAiApiKey": "local",
+        "openAiModelId": "dsv41-xq-v4",
+        "openAiStreamingEnabled": true,
+        "openAiStrictToolSchemas": false,
+        "openAiR1FormatEnabled": false,
+        "openAiUseAzure": false,
+        "includeMaxTokens": true,
+        "modelMaxTokens": 65536,
+        "enableReasoningEffort": false,
+        "openAiCustomModelInfo": {
+          "contextWindow": 262144,
+          "maxTokens": 65536,
+          "supportsImages": false,
+          "supportsPromptCache": false,
+          "supportsToolCalling": true,
+          "inputPrice": 0,
+          "outputPrice": 0
+        }
+      }
+    },
+    "modeApiConfigs": {
+      "architect": "xolotlqfn45",
+      "code": "xolotlqfn45",
+      "ask": "xolotlqfn45",
+      "debug": "xolotlqfn45",
+      "orchestrator": "xolotlqfn45"
+    }
+  },
+  "globalSettings": {
+    "taskTitleGenerationEnabled": false,
+    "terminalShellIntegrationDisabled": false
+  }
+}
