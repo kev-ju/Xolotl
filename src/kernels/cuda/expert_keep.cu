@@ -8,6 +8,10 @@
 #include <cstring>
 #include <vector>
 
+#ifdef _WIN32
+#define strtok_r strtok_s  // MSVC has no POSIX strtok_r; strtok_s has the same signature (#143)
+#endif
+
 namespace strata::kernels {
 namespace {
 
